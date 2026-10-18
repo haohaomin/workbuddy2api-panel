@@ -82,22 +82,30 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wb2api-panel-${{ env.VERSION }}-windows-amd64
-          path: dist/windows-amd64
+          path: |
+            dist/windows-amd64
+            dist/wb2api-panel-${{ env.VERSION }}-windows-amd64.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: wb2api-panel-${{ env.VERSION }}-windows-arm64
-          path: dist/windows-arm64
+          path: |
+            dist/windows-arm64
+            dist/wb2api-panel-${{ env.VERSION }}-windows-arm64.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: wb2api-panel-${{ env.VERSION }}-linux-amd64
-          path: dist/linux-amd64
+          path: |
+            dist/linux-amd64
+            dist/wb2api-panel-${{ env.VERSION }}-linux-amd64.zip
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: wb2api-panel-${{ env.VERSION }}-linux-arm64
-          path: dist/linux-arm64
+          path: |
+            dist/linux-arm64
+            dist/wb2api-panel-${{ env.VERSION }}-linux-arm64.zip
           if-no-files-found: error
 
   build-macos:
