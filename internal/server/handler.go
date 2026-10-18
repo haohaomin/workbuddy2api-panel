@@ -1462,6 +1462,12 @@ func parseUsageTotalTokens(total float64) (int, bool) {
 	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
 		return 0, false
 	}
+	// Converting 2^63 from float64 to int on some Go architectures saturates
+	// at MaxInt. Since float64(MaxInt) rounds back to 2^63, the round-trip
+	// check below would otherwise accept this out-of-range token count.
+	if total >= math.Exp2(float64(strconv.IntSize-1)) {
+		return 0, false
+	}
 	parsed := int(total)
 	if parsed <= 0 || float64(parsed) != total {
 		return 0, false

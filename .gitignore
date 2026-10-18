@@ -19,6 +19,7 @@ API_KEY.txt
 
 # Build artifacts
 *.tmp
+/dist/
 __pycache__/
 
 # Backups (contains auth tokens)

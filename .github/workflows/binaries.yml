@@ -10,50 +10,75 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            # Use Shanghai time for non-tag artifacts. Tags remain the source
+            # of truth for releases, so a runner clock cannot rename a release.
+            if [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ]; then
+              version="$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)"
+            else
+              version="$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)"
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
 
-      - name: test
+      - name: Test
         run: go test ./...
 
-      # ponytail: 标签发版用标签名，避免 CI 时钟和标签差一分钟变成两个号。
-      - name: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          else
-            echo "VERSION=$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)" >> "$GITHUB_ENV"
-          fi
-
-      - name: build
+      - name: Build Windows and Linux binaries
+        shell: bash
         run: |
           set -euo pipefail
-          # ponytail: 包结构跟上游一样；主程序 windows/linux × amd64/arm64。
           mkdir -p dist
           pack() {
             dir="dist/$1-$2"
             mkdir -p "$dir"
             cp "$3" "$dir/"
             cp config.example.json README.md "$dir/"
-            python3 -c 'import os,sys,zipfile; n,d=sys.argv[1:]; z=zipfile.ZipFile(n,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(d,f), f) for f in os.listdir(d)]; z.close()' \
-              "dist/wb2api-panel-${VERSION}-$1-$2.zip" "$dir"
+            python3 - "$dir" "dist/wb2api-panel-${VERSION}-$1-$2.zip" <<'PY'
+          import pathlib, sys, zipfile
+
+          directory = pathlib.Path(sys.argv[1])
+          archive = pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in directory.iterdir():
+                  z.write(path, path.name)
+          PY
           }
-          for os in windows linux; do
+
+          for os_name in windows linux; do
             bin=wb2api
-            [ "$os" = windows ] && bin=wb2api.exe
+            [ "$os_name" = windows ] && bin=wb2api.exe
             for arch in amd64 arm64; do
-              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-                go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" -o "$bin" ./cmd/server
-              pack "$os" "$arch" "$bin"
+              CGO_ENABLED=0 GOOS="$os_name" GOARCH="$arch" \
+                go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" \
+                -o "$bin" ./cmd/server
+              pack "$os_name" "$arch" "$bin"
             done
           done
 
-      # ponytail: 四个 upload，每个系统架构一个 artifact。matrix 等构建时间不够再用。
       - uses: actions/upload-artifact@v4
         with:
           name: wb2api-panel-${{ env.VERSION }}-windows-amd64
@@ -75,8 +100,80 @@ jobs:
           path: dist/linux-arm64
           if-no-files-found: error
 
-      - name: release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+  build-macos:
+    needs: version
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build macOS app bundles and DMGs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in arm64 amd64; do
+            dir="dist/darwin-${arch}"
+            app="$dir/WorkBuddy2API.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" \
+              -o "$app/Contents/Resources/wb2api" ./cmd/server
+            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "$app/Contents/MacOS/WorkBuddy2API" ./cmd/macosapp
+            cp scripts/macos/Info.plist "$app/Contents/Info.plist"
+            cp README.md "$dir/README.md"
+
+            python3 - "$dir" "dist/wb2api-panel-${VERSION}-darwin-${arch}.zip" <<'PY'
+          import pathlib, sys, zipfile
+
+          directory = pathlib.Path(sys.argv[1])
+          archive = pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+              for path in directory.rglob("*"):
+                  if path.is_file():
+                      z.write(path, pathlib.Path(directory.name) / path.relative_to(directory))
+          PY
+
+            stage="$(mktemp -d)"
+            cp -R "$app" "$stage/WorkBuddy2API.app"
+            ln -s /Applications "$stage/Applications"
+            hdiutil create -quiet -volname WorkBuddy2API -srcfolder "$stage" \
+              -ov -format UDZO "dist/wb2api-panel-${VERSION}-darwin-${arch}.dmg"
+            rm -rf "$stage"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-panel-${{ env.VERSION }}-darwin
+          path: dist
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, build, build-macos]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "v${VERSION}" dist/*.zip --title "v${VERSION}" --generate-notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find release-assets -type f \( -name '*.zip' -o -name '*.dmg' \) -print | sort)
+          [ "${#files[@]}" -gt 0 ]
+          gh release create "v${VERSION}" "${files[@]}" \
+            --title "v${VERSION}" \
+            --generate-notes
