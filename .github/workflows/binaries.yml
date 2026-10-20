@@ -13,29 +13,24 @@ on:
 permissions:
   contents: write
 
+# Serialize releases, including manual tags, without cancelling an active upload.
+concurrency:
+  group: binaries-release
+  cancel-in-progress: false
+
 jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Resolve version
         id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            # Use Shanghai time for non-tag artifacts. Tags remain the source
-            # of truth for releases, so a runner clock cannot rename a release.
-            if [ "$(TZ=UTC date +%H)" = "$(TZ=Asia/Shanghai date +%H)" ]; then
-              version="$(date -u -d '+8 hours' +%Y.%-m.%-d.%-H%M)"
-            else
-              version="$(TZ=Asia/Shanghai date +%Y.%-m.%-d.%-H%M)"
-            fi
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+        # GITHUB_TOKEN tag pushes do not trigger another workflow; publish below.
+        run: python3 scripts/release-version.py
 
   build:
     needs: version
@@ -49,7 +44,9 @@ jobs:
           go-version-file: go.mod
 
       - name: Test
-        run: go test ./...
+        run: |
+          python3 tests/test-release-version.py
+          go test ./...
 
       - name: Build Windows and Linux binaries
         shell: bash
@@ -172,7 +169,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     needs: [version, build, build-macos]
     runs-on: ubuntu-latest
     env:
@@ -191,9 +188,17 @@ jobs:
           set -euo pipefail
           python3 scripts/macos/update-manifest.py "$VERSION" release-assets
           mapfile -t files < <(find release-assets -type f \( -name '*.zip' -o -name '*.dmg' \) -print | sort)
-          [ "${#files[@]}" -gt 0 ]
-          gh release create "v${VERSION}" "${files[@]}" release-assets/macos-update.json \
-            --title "v${VERSION}" \
-            --generate-notes --draft --verify-tag
+          [ "${#files[@]}" -eq 10 ]
+          state="$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [ "$state" = false ]; then
+            echo "v${VERSION} is already published; leaving its assets unchanged."
+            exit 0
+          fi
+          if [ "$state" != true ]; then
+            gh release create "v${VERSION}" --title "v${VERSION}" \
+              --generate-notes --draft --verify-tag
+          fi
+          # A failed upload can be retried against the existing draft.
+          gh release upload "v${VERSION}" "${files[@]}" release-assets/macos-update.json --clobber
           # Make the release discoverable only after every asset and manifest is uploaded.
           gh release edit "v${VERSION}" --draft=false --latest

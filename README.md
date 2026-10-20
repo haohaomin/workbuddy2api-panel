@@ -302,7 +302,7 @@ exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到�
 
 替换助手等待旧应用退出，通过 macOS 原子交换切换应用，避免安装路径短暂缺失，并通过安装锁阻止两个更新助手并发替换。旧版保存在安装目录的 `.WorkBuddy2API-update-<UUID>/backup/WorkBuddy2API.app`，再启动新版并等待就绪确认。启动失败时恢复旧版；旧版备份不会在确认前删除，成功后也保留供手动恢复。更新成功或回滚结果会保留显示；窗口提供「发布说明」「更新日志」入口。旧进程退出后如再校验失败，也会重新打开原应用。安装日志位于数据目录的 `data/updater.log`。更新器只替换 `.app`，不迁移或删除账号、配置和运行数据。安装目录不可写时会报告错误并保留当前安装，请先将应用放入可写的「应用程序」目录。
 
-旧 Release 没有专用更新包时，会提示尚未提供兼容包，不会安装旧启动器或任意 ZIP。发布工作流在下一次时间标签发布时生成两个架构的更新包；本地 `dev` 构建可手动选择安装正式版本。
+旧 Release 没有专用更新包时，会提示尚未提供兼容包，不会安装旧启动器或任意 ZIP。每次推送到 `main` 后，发布工作流自动打上海时间标签、构建并发布两个架构的更新包及清单；本地 `dev` 构建可手动选择安装正式版本。
 
 本地构建需要 Go 和 Xcode Command Line Tools（`xcode-select --install`）：
 
@@ -941,9 +941,10 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **预编译二进制**：推送到 `main` 或手动运行时，Actions 按系统架构分开上传 artifact，名字是 `wb2api-panel-<ref>-<os>-<arch>`，里面是主程序、`config.example.json`、`README.md`。推送 `v*` tag 时同样构建，并各挂一个 `wb2api-panel-<tag>-<os>-<arch>.zip` 到 Release。Docker 仍由本地 `docker compose build` 构建
+- **自动发布**：提交并 `git push origin main` 后，Actions 自动生成上海时间版本（如 `v2026.10.20.711`），给本次提交打标签；所有平台构建和测试通过后发布为 Latest Release。包含 Windows/Linux ZIP、macOS 两种架构的 ZIP、DMG、应用更新包及 `macos-update.json`。只在本地 commit 不会触发；仅修改 AutoBot 专用文件仍跳过。仍支持手动推送时间标签，在 `main` 手动运行也会发布，其他分支手动运行仅上传 artifact。
+- **发布重试**：失败时在 Actions 重跑即可，沿用同一提交的标签，继续上传草稿；已公开的 Release 不覆盖。标签时间被另一提交占用时会等待下一分钟。发布串行执行，密集推送时 GitHub 保留最新待运行任务。Docker 镜像继续由独立的 `docker-ghcr` 工作流发布。
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **产物校验**：macOS 更新清单包含更新包 SHA-256；客户端会校验下载完整性。当前没有独立发布者签名或 Apple 公证，信任依赖 GitHub HTTPS 和仓库权限。`go.sum` 仅约束 Go 模块依赖。
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界
