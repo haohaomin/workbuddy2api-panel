@@ -23,6 +23,11 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
+	// DNSServers 出站解析用的 DNS 服务器（空 = 用系统解析器）；也可用 WB2A_DNS 覆盖
+	// （逗号分隔）。给没有 /etc/resolv.conf 的环境用：Android 上 Go 的解析器会退回
+	// [::1]:53，所有域名解析直接失败；本地 DNS 被污染时也可借此直连可信解析器。
+	DNSServers []string `json:"dns_servers,omitempty"`
+
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
 		PackageDetailLimit int `json:"package_detail_limit"`
@@ -132,6 +137,15 @@ type Config struct {
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
 
+	CN struct {
+		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
+		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
+		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
+		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
+		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
+
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -164,6 +178,13 @@ type Config struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
+
+	Models struct {
+		// Hidden 不对外暴露的模型黑名单。裸名=两域都藏；"cn:xxx"/"global:xxx"=只藏该域。
+		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
+		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
+		Hidden []string `json:"hidden"`
+	} `json:"models"`
 
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
@@ -265,6 +286,11 @@ type Config struct {
 	} `json:"alerting"`
 	Budget struct {
 		DailyCreditLimit float64 `json:"daily_credit_limit"` // 0 = 不限
+		// BurstCreditLimit 5 分钟窗口内累计 credit 达此值即拒绝（0 = 关闭）。
+		// issue #229：高倍率模型 140k 上下文一次 20+ 积分，日上限止血太慢。
+		BurstCreditLimit float64 `json:"burst_credit_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于此百分比即冷却 60s（0 = 关闭）。
+		CacheLowRate float64 `json:"cache_low_rate"`
 	} `json:"budget"`
 
 	// 解析后
@@ -451,6 +477,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	if v := os.Getenv("WB2A_DNS"); v != "" {
+		c.DNSServers = splitCSV(v)
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -561,6 +590,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 	fields := []struct{ env, path, kind string }{
 		{"WB2A_LISTEN", "listen", ""}, {"WB2A_API_KEY", "api_key", ""},
 		{"WB2A_AUTH_DIR", "auth_dir", ""}, {"WB2A_STATE_FILE", "state_file", ""},
+		{"WB2A_DNS", "dns_servers", ""},
 		{"WB2A_SOFT_RATE", "cooldown.soft_rate", ""}, {"WB2A_SOFT_RATE_MAX", "cooldown.soft_rate_max", ""},
 		{"WB2A_TIMEOUT_SECONDS", "upstream.timeout_seconds", "int"}, {"WB2A_HEADER_TIMEOUT_SECONDS", "upstream.header_timeout_seconds", "int"},
 		{"WB2A_IDLE_TIMEOUT_SECONDS", "upstream.idle_timeout_seconds", "int"}, {"WB2A_USER_AGENT", "upstream.user_agent", ""},
@@ -598,6 +628,18 @@ func (c *Config) EnvironmentManagedFields() []string {
 			}
 		}
 		out = append(out, field.path)
+	}
+	return out
+}
+
+// splitCSV 逗号分隔 → 去空白、丢空项（WB2A_DNS 用）。
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
 	}
 	return out
 }
@@ -769,6 +811,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Budget.DailyCreditLimit < 0 {
 		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 不限", c.Budget.DailyCreditLimit)
+	}
+	if c.Budget.BurstCreditLimit < 0 {
+		return fmt.Errorf("budget.burst_credit_limit: %v 不得为负；0 = 关闭", c.Budget.BurstCreditLimit)
+	}
+	if c.Budget.CacheLowRate < 0 || c.Budget.CacheLowRate > 100 {
+		return fmt.Errorf("budget.cache_low_rate: %v 须在 0-100 之间（百分比）；0 = 关闭", c.Budget.CacheLowRate)
 	}
 	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("admin.enabled=true 但 api_key 为空")

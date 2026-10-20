@@ -226,6 +226,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
@@ -265,6 +267,7 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.md-avail { flex: none; padding: 0 6px; font-size: 10.5px; line-height: 16px; }
 .rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
 .rate-limit {
   display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
@@ -337,6 +340,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .state.ok { color: var(--ok); } .state.err { color: var(--bad); }
 .dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
 @keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
+
+/* ── 券码弹窗（票券式卡片，类名全部 vc- 前缀防越界）────────────────── */
+.vc-acct { display: flex; align-items: baseline; gap: 7px; margin: 18px 2px 8px;
+  font-size: 12px; color: var(--ink-3); }
+.vc-acct:first-child { margin-top: 4px; }
+.vc-acct .nm { font-weight: 650; font-size: 13px; color: var(--ink-2); }
+.vc { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; margin: 0 0 10px;
+  background: var(--surface); transition: border-color .15s; }
+.vc:hover { border-color: var(--accent); }
+.vc .hd { display: flex; align-items: center; gap: 8px; padding: 12px 14px 4px; }
+.vc .hd .nm { font-weight: 640; font-size: 14px; }
+.vc .hd .tag { margin-left: auto; }
+.vc .meta { padding: 2px 14px 10px; font-size: 11.5px; color: var(--ink-3); }
+.vc .sep { border-top: 1px dashed var(--line); margin: 0 12px; }
+.vc .ft { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
+.vc .ft .lab { font-size: 11.5px; color: var(--ink-3); flex: none; }
+.vc .ft code { font: 600 15px/1 var(--mono); letter-spacing: 1.2px; user-select: all;
+  background: var(--surface-2); border: 1px solid var(--line-soft);
+  border-radius: 7px; padding: 7px 12px; }
+.vc .ft .acts { margin-left: auto; display: flex; gap: 8px; flex: none; }
+.vc .vc-qr { border-top: 1px dashed var(--line); padding: 14px; display: flex; justify-content: center; }
+.vc .vc-qr svg { border-radius: 6px; }
+/* 过期态：只淡标题与元信息（保持券码可读），边框改虚线示意作废 */
+.vc.expired { border-style: dashed; }
+.vc.expired .hd, .vc.expired .meta { opacity: .55; }
 
 /* ── Toast ───────────────────────────────────────────────────────── */
 #toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
@@ -746,6 +774,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <label class="sel-note">并发
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
+          <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <button class="xs" id="btnScanAll">扫描待办</button>
           <button class="xs" id="btnTaskJobsReload">刷新进度</button>
           <button class="xs primary" id="btnRunQueue">执行全部待办</button>
@@ -1136,6 +1165,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="hr"></div>
             <div class="grid2">
+              <label class="fld"><span class="lb">模型黑名单</span>
+                <input name="models_hidden" placeholder="deepseek-pro, cn:legacy-model">
+                <span class="hint">逗号分隔；裸名隐藏两域，cn: / global: 只隐藏该域；/v1/models 不列且点名调用直接拒绝，保存即热生效</span></label>
+            </div>
+
+            <div class="hr"></div>
+            <div class="grid2">
               <label class="fld"><span class="lb">系统提示词模式</span>
                 <select name="prompt_mode">
                   <option value="custom">custom — 网关自有提示词（避免指纹误报）</option>
@@ -1321,6 +1357,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
+        <button class="tab" data-tab="apikey">API Key</button>
       </div>
     </header>
     <div class="body">
@@ -1343,6 +1380,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="addDone" class="state ok" hidden></div>
         <div id="addErr" class="state err" hidden></div>
       </div>
+      <!-- 静态 API Key -->
+      <div id="addTabApiKey" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">粘贴 CodeBuddy 平台签发的静态 API Key（ck_/pt_ 前缀）。添加后直接可用、无需浏览器登录；该账号无签到 / 成长任务体系，额度走企业口径。</div>
+        <input type="password" id="apiKeyInput" placeholder="ck_..." autocomplete="off" style="width:100%;margin-bottom:8px">
+        <input type="text" id="apiKeyNickname" placeholder="昵称（可选）" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <input type="text" id="apiKeyUid" placeholder="uid（可选，缺省由 key 派生）" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <div id="apiKeyDone" class="state ok" hidden></div>
+        <div id="apiKeyErr" class="state err" hidden></div>
+      </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
         <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
@@ -1354,6 +1400,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button id="btnStartLogin" class="primary">获取授权链接</button>
+      <button id="btnAddApiKey" hidden class="primary">添加 API Key</button>
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
@@ -1396,6 +1443,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="grow"></span>
       <button id="btnRemarkClose">关闭</button>
       <button class="primary" id="btnRemarkSave">保存</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 开学季券码 -->
+<div class="veil" id="vcVeil">
+  <div class="dlg">
+    <header>
+      <h3>开学季 · 我的券码</h3>
+      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
+    </header>
+    <div class="body" id="vcBody"></div>
+    <footer>
+      <span class="hint" id="vcNote"></span>
+      <span class="grow"></span>
+      <button class="xs" id="btnVcRefresh">刷新</button>
+      <button class="xs primary" id="btnVcClose">关闭</button>
     </footer>
   </div>
 </div>

@@ -16,6 +16,7 @@ let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'defaul
    （表现为点「展开」后什么都不点又自动收起）。键 = tbody id。 */
 const restOpen = Object.create(null);
 let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let mdLocks = [], mdRecent = [];
 let reqFilter = { q: '', outcome: '' };
 let reqEntries = [];
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
@@ -449,6 +450,9 @@ function renderAccounts(list) {
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
     const frozen = s.disabled || cool > 0;
+    // 无个人成长体系的账号（企业版 / 静态 API Key）：签到与成长任务端点在上游对自己
+    // 恒失败，按钮点了只会报错，故不渲染；「额度」按钮走企业口径端点照常可用。
+    const personal = !(s.enterprise || s.api_key);
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -458,7 +462,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -471,17 +475,17 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
-        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
-        // upstream 的 get-enterprise-user-usage 口径填充。
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
+        // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
+        // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
+        (personal ?
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' : '') +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
-        (s.enterprise ? '' :
-          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
+        (personal ?
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : '') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
@@ -705,12 +709,20 @@ async function loadModels(force) {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    // 探测数据是可选增强：拉取失败不影响模型列表本身
+    // 探测、模型锁与最近请求都是本地可选增强：任一失败不影响模型目录本身。
+    // 可用性标签不额外发推理请求，只用模型锁和最近真实请求结果合成。
     // force=true（「重新获取」按钮）：带 refresh=1 让后端清掉 global 目录 1h 缓存，
     // 真正重新问一次上游，否则点多少次都是同一份缓存（issue #216 现象 3）。
-    const [d, pr] = await Promise.all([api('models' + (force ? '?refresh=1' : '')), api('model_probes').catch(() => ({}))]);
+    const [d, pr, st, rm] = await Promise.all([
+      api('models' + (force ? '?refresh=1' : '')),
+      api('model_probes').catch(() => ({})),
+      api('status').catch(() => ({})),
+      api('request_metrics').catch(() => ({})),
+    ]);
     mdAll = d.models || [];
     mdProbes = pr.probes || {};
+    mdLocks = Array.isArray(st.model_locks) ? st.model_locks : [];
+    mdRecent = Array.isArray(rm.recent) ? rm.recent : [];
     if (!mdAll.length) {
       tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
       $('mdCount').textContent = '';
@@ -790,6 +802,67 @@ function mdSortList(list, f) {
   return out;
 }
 
+// mdAvailabilityOf 合成 Global 模型当前可用性：模型锁优先于最近请求结果。
+// 只返回有真实本地证据的状态；目录中存在但从未请求过的模型标为“待验证”，
+// 避免把“上游列出了模型”误当成“当前账号有权限”。
+function mdAvailabilityOf(m, locks, recent) {
+  const id = String((m && m.id) || '');
+  if (!id.startsWith('global:')) return null;
+  locks = Array.isArray(locks) ? locks : mdLocks;
+  recent = Array.isArray(recent) ? recent : mdRecent;
+  const bare = id.slice('global:'.length);
+  const lock = locks.find(r => r && r.realm === 'global' && r.model === bare);
+  if (lock) {
+    const reason = String(lock.reason || '').trim();
+    const lower = reason.toLowerCase();
+    if (lock.state === 'partial') {
+      return { key: 'partial', label: '部分可用', cls: 'warn',
+        tip: '仍有 ' + Number(lock.servable || 0) + ' 个 global 账号可服务；已锁 ' + Number(lock.locked || 0) + ' 个' + (reason ? '；' + reason : '') };
+    }
+    if (lock.state === 'starved') {
+      return { key: 'starved', label: '账号暂不可用', cls: 'mute',
+        tip: '没有账号能服务该模型，但并非该模型自身被锁；请检查账号冷却/在途占用' };
+    }
+    if (lower.startsWith('11158') || lower.includes('not allowed for user type')) {
+      return { key: 'denied', label: '无权限', cls: 'bad',
+        tip: '当前 global 账号类型不支持该模型' + (reason ? '；' + reason : '') };
+    }
+    if (lower.startsWith('11102') || lower.includes('service info not found')) {
+      return { key: 'missing', label: '上游无此模型', cls: 'bad',
+        tip: '上游目录残留，实际请求返回模型不存在' + (reason ? '；' + reason : '') };
+    }
+    return { key: 'limited', label: '限流/不可用', cls: 'warn',
+      tip: '模型级冷却中' + (reason ? '；' + reason : '') };
+  }
+  const ev = recent.find(e => e && e.model === id);
+  if (ev) {
+    const status = Number(ev.status || 0);
+    const when = ev.time ? new Date(ev.time).toLocaleString('zh-CN', { hour12: false }) : '';
+    if (ev.outcome === 'success' || (status >= 200 && status < 300)) {
+      return { key: 'ok', label: '可用', cls: 'ok',
+        tip: '最近一次真实请求成功' + (when ? ' · ' + when : '') };
+    }
+    if (status === 429) {
+      return { key: 'rate', label: '限流', cls: 'warn',
+        tip: '最近一次请求被限流' + (when ? ' · ' + when : '') };
+    }
+    if (status >= 500) {
+      return { key: 'upstream', label: '上游错误', cls: 'bad',
+        tip: '最近一次请求上游错误 HTTP ' + status + (when ? ' · ' + when : '') };
+    }
+    return { key: 'failed', label: '最近失败', cls: 'bad',
+      tip: '最近一次请求失败 HTTP ' + (status || '—') + (when ? ' · ' + when : '') };
+  }
+  return { key: 'unknown', label: '待验证', cls: 'mute',
+    tip: '尚无模型锁或近期真实请求记录；目录存在不代表当前账号有权限' };
+}
+
+function mdAvailabilityTag(m) {
+  const av = mdAvailabilityOf(m);
+  if (!av) return '';
+  return ' <span class="tag ' + av.cls + ' md-avail" title="' + esc(av.tip) + '">' + esc(av.label) + '</span>';
+}
+
 // mdRowHtml 单个模型行（纯渲染，便于独立测试）。
 // 上游模型繁忙度（/v2/chat/busy）文案：只标需要避让的三档，idle/normal 不打扰。
 const BUSY_WORDS = { busy: '繁忙', congested: '拥堵', unavailable: '不可用' };
@@ -814,7 +887,7 @@ function mdRowHtml(m, pr) {
   }
   const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
   const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + mdAvailabilityTag(m) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rateCell(m) + '</td>' +
     '<td>' + (m.default_effort && !m.image_generation ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
     '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -1197,6 +1270,7 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
+  models_hidden: ['models', 'hidden'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1251,8 +1325,10 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
+      // 逗号/空白分隔的列表字段：空 = 显式清空黑名单（空数组照发，否则删不掉条目）。
+      if (name === 'models_hidden') v = raw.split(/[,，\s]+/).filter(Boolean);
       // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
-      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
+      else if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
@@ -1331,14 +1407,20 @@ function openAdd() {
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
+  $('apiKeyDone').hidden = true; $('apiKeyErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  $('btnAddApiKey').hidden = true;
   stopPoll();
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  $('addTabApiKey').hidden = tab !== 'apikey';
+  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」，导入页无页脚按钮。
+  $('btnAddApiKey').hidden = tab !== 'apikey';
+  $('btnStartLogin').hidden = tab !== 'login' || loginState != null;
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -1405,6 +1487,31 @@ async function pollLogin() {
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
+
+$('btnAddApiKey').onclick = async () => {
+  const token = ($('apiKeyInput').value || '').trim();
+  $('apiKeyDone').hidden = true; $('apiKeyErr').hidden = true;
+  if (!token) { $('apiKeyErr').hidden = false; $('apiKeyErr').textContent = '请填写 API Key'; return; }
+  const btn = $('btnAddApiKey');
+  btn.disabled = true;
+  try {
+    const r = await api('accounts/add_apikey', {
+      method: 'POST',
+      body: JSON.stringify({
+        access_token: token,
+        nickname: ($('apiKeyNickname').value || '').trim(),
+        uid: ($('apiKeyUid').value || '').trim(),
+      }),
+    });
+    $('apiKeyDone').hidden = false;
+    $('apiKeyDone').textContent = '已添加 ' + (r.nickname || r.uid) + '（API Key 账号），账号已载入池中';
+    $('apiKeyInput').value = '';
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    $('apiKeyErr').hidden = false;
+    $('apiKeyErr').textContent = '添加失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
@@ -1547,6 +1654,7 @@ const AUTO_TASKS = {
   'Hp_Appearance': '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
+  'WorkBuddy_Valorant': '真实「无畏契约拼豆专家」召唤+使用链（真实对话 requestId，截止 11-15）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
   'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
   'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）',
@@ -1802,6 +1910,10 @@ $('taskBody').addEventListener('click', async ev => {
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
+$('btnSchoolVouchers').onclick = loadSchoolVouchers;
+$('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
+$('btnVcRefresh').onclick = loadSchoolVouchers;
+
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
@@ -3051,6 +3163,231 @@ function bindRestToggle(id) {
 }
 bindRestToggle('expBody');
 bindRestToggle('compBody');
+
+/* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
+   规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+   完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
+   可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证
+   （强制 byte 模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
+// GF(256) 对数/指数表（本原多项式 0x11d）
+const QR_EXP = new Array(512), QR_LOG = new Array(256);
+(() => {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { QR_EXP[i] = x; QR_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+})();
+const gmul = (a, b) => (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0;
+
+// 各版本参数（下标 = 版本-1）：[数据码字数, 纠错码字数]，ECC L 单块
+const QR_V = [[19, 7], [34, 10], [55, 15], [80, 20], [108, 26]];
+// 对齐图案中心坐标（v2+；与定位图案重叠的位置在放置时跳过）
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30]];
+const QR_MASK = (r, c) => (r + c) % 2 === 0; // 掩码模式 0
+
+// 生成多项式（最高次系数在前，g[0] 恒为 1）
+function qrGenPoly(deg) {
+  let g = [1];
+  for (let i = 0; i < deg; i++) {
+    const a = QR_EXP[i], ng = new Array(g.length + 1).fill(0);
+    ng[0] = g[0];
+    for (let j = 1; j < g.length; j++) ng[j] = g[j] ^ gmul(a, g[j - 1]);
+    ng[g.length] = gmul(a, g[g.length - 1]);
+    g = ng;
+  }
+  return g;
+}
+
+// Reed-Solomon 求余（综合除法），返回 deg 个纠错码字
+function rsRem(data, deg) {
+  const g = qrGenPoly(deg);
+  const res = data.concat(new Array(deg).fill(0));
+  for (let i = 0; i < data.length; i++) {
+    const f = res[i];
+    if (f) for (let j = 0; j < g.length; j++) res[i + j] ^= gmul(g[j], f);
+  }
+  return res.slice(data.length);
+}
+
+// 文本 → 码字流（byte 模式：0100 + 8 位计数 + 数据 + 终止符 + 0xEC/0x11 填充）
+function qrDataCodewords(text, dataCap) {
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  push(4, 4);            // byte 模式
+  push(bytes.length, 8); // v1-9 计数 8 位
+  for (const b of bytes) push(b, 8);
+  const cap = dataCap * 8;
+  push(0, Math.min(4, cap - bits.length));   // 终止符
+  while (bits.length % 8) bits.push(0);
+  const out = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let v = 0; for (const b of bits.slice(i, i + 8)) v = (v << 1) | b;
+    out.push(v);
+  }
+  for (let p = 0; out.length < dataCap; p ^= 1) out.push(p ? 0x11 : 0xEC);
+  return out;
+}
+
+// 主入口：text → 布尔矩阵（true=深色模块）
+function qrMatrix(text) {
+  const bytes = Array.from(new TextEncoder().encode(text));
+  // 版本选择：需求 ≈ 2 码字头 + 文本长度，取首个放得下的版本
+  let ver = 0;
+  for (let v = 0; v < QR_V.length; v++) { if (bytes.length + 2 <= QR_V[v][0]) { ver = v + 1; break; } }
+  if (!ver) throw new Error('QR: text too long (>' + QR_V[4][0] + ' bytes)');
+  const [dataCap, ecCap] = QR_V[ver - 1];
+  const n = 17 + 4 * ver;
+
+  const M = Array.from({ length: n }, () => new Array(n).fill(false));
+  const F = Array.from({ length: n }, () => new Array(n).fill(false)); // 功能模块占位
+
+  const setF = (r, c, v) => { M[r][c] = v; F[r][c] = true; };
+  // 定位图案 + 分隔带
+  const finder = (r0, c0) => {
+    for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+      const rr = r0 + r, cc = c0 + c;
+      if (rr < 0 || cc < 0 || rr >= n || cc >= n) continue;
+      const dark = r >= 0 && r <= 6 && c >= 0 && c <= 6 && (r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4));
+      setF(rr, cc, dark);
+    }
+  };
+  finder(0, 0); finder(0, n - 7); finder(n - 7, 0);
+  // 校正图形（仅贯穿两定位图案之间：8..n-9，不得覆盖定位图案本体）
+  for (let r = 8; r <= n - 9; r++) setF(r, 6, r % 2 === 0);
+  for (let c = 8; c <= n - 9; c++) setF(6, c, c % 2 === 0);
+  // 对齐图案（v2+，跳过与定位重叠处）
+  const align = QR_ALIGN[ver - 1] || [];
+  for (const ar of align) for (const ac of align) {
+    if (F[ar][ac]) continue;
+    for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++)
+      setF(ar + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
+  }
+  // 暗模块 + 格式信息（ECC L=01，掩码 0）——BCH(15,5) + 0x5412 异或。
+  // 位序遵循规范（与 python qrcode 逐位对齐验证）：bit i 从 LSB 起数，
+  // 副本一走左上角 L 形、副本二走右下 L 形。
+  let fmt = (1 << 3) | 0; // L<<3 | mask
+  let rem = fmt << 10;
+  for (let i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= 0x537 << (i - 10);
+  fmt = ((fmt << 10) | rem) ^ 0x5412; // 15 位
+  const fb = i => (fmt >> i) & 1;
+  // 副本一（左上）：位 0..5 → (i,8)；6 → (7,8)；7 → (8,8)
+  for (let i = 0; i <= 5; i++) setF(i, 8, !!fb(i));
+  setF(7, 8, !!fb(6)); setF(8, 8, !!fb(7));
+  // 副本一续 + 副本二（右下）：位 8..14 → (n-15+i, 8)；位 0..7 → (8, n-1-i)；8 → (8,7)；9..14 → (8,14-i)
+  for (let i = 8; i <= 14; i++) setF(n - 15 + i, 8, !!fb(i));
+  for (let i = 0; i <= 7; i++) setF(8, n - 1 - i, !!fb(i));
+  setF(8, 7, !!fb(8));
+  for (let i = 9; i <= 14; i++) setF(8, 14 - i, !!fb(i));
+  // 暗模块（恒为深色，位于副本一垂直段末端）
+  setF(n - 8, 8, true);
+
+  // 数据码字 + 纠错码字 → 位流
+  const dcw = qrDataCodewords(text, dataCap);
+  const cw = dcw.concat(rsRem(dcw, ecCap));
+  const bits = [];
+  for (const b of cw) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+
+  // 蛇形放置（成对列，从右向左，跳过第 6 列），写数据时直接异或掩码
+  let bi = 0, up = true;
+  for (let x = n - 1; x > 0; x -= 2) {
+    if (x === 6) x--;
+    for (let i = 0; i < n; i++) {
+      const r = up ? n - 1 - i : i;
+      for (const c of [x, x - 1]) {
+        if (F[r][c]) continue;
+        const bit = bi < bits.length ? bits[bi++] : 0;
+        M[r][c] = bit ? !QR_MASK(r, c) : QR_MASK(r, c);
+      }
+    }
+    up = !up;
+  }
+  return M;
+}
+
+// 矩阵 → SVG（quiet zone 4 模块）
+function qrSVG(M, px) {
+  const n = M.length, q = 4, total = n + q * 2;
+  let s = '<svg viewBox="0 0 ' + total + ' ' + total + '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges" role="img" style="background:#fff">';
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (M[r][c]) s += '<rect x="' + (c + q) + '" y="' + (r + q) + '" width="1" height="1"/>';
+  return s + '</svg>';
+}
+
+/* ── 开学季券码查询（弹窗，仿活动页 #/prizes?tab=vouchers）──────────── */
+/* copyText：clipboard API 只在 secure context（https/localhost）可用，
+   远程 http 面板会拿不到 navigator.clipboard → 降级 execCommand。 */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy') ? resolve() : reject(new Error('copy failed')); }
+    catch (e) { reject(e); }
+    finally { ta.remove(); }
+  });
+}
+
+function vcCard(v) {
+  const expired = v.valid_to && new Date(v.valid_to) < new Date();
+  return '<div class="vc' + (expired ? ' expired' : '') + '">' +
+    '<div class="hd"><span class="nm">' + esc(v.prize_name || v.sku_code || '券') + '</span>' +
+    (expired ? '<span class="tag bad">已过期</span>' : '<span class="tag ok">可使用</span>') + '</div>' +
+    '<div class="meta">' +
+      (v.valid_to ? '有效期至 ' + esc(v.valid_to) : '长期有效') +
+      (v.granted_at ? ' · ' + esc(v.granted_at.slice(0, 10)) + ' 抽中' : '') +
+    '</div>' +
+    '<div class="sep"></div>' +
+    '<div class="ft"><span class="lab">券码</span><code>' + esc(v.code || '-') + '</code>' +
+    '<span class="acts">' +
+      (v.code ? '<button class="xs ghost" data-qr="' + esc(v.code) + '">二维码</button>' : '') +
+      '<button class="xs ghost" data-copy="' + esc(v.code || '') + '">复制</button>' +
+    '</span></div>' +
+    '</div>';
+}
+
+async function loadSchoolVouchers() {
+  const body = $('vcBody');
+  $('vcVeil').classList.add('on');
+  body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
+  $('vcNote').textContent = '';
+  try {
+    const d = await api('school/vouchers');
+    const arr = d.accounts || [];
+    const ok = arr.filter(a => !a.error);
+    const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
+    body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
+      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+      '<span>' + a.vouchers.length + ' 张</span></div>' +
+      a.vouchers.map(vcCard).join('')
+    ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
+    $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
+    const errs = arr.filter(a => a.error);
+    if (errs.length) {
+      body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
+        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
+    }
+    body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
+      try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
+      catch (e) { toast('复制失败，请手动选择券码', 'err'); }
+    });
+    // 二维码：券码本体编码为 QR（到店出示扫描），点击切换显示/隐藏
+    body.querySelectorAll('button[data-qr]').forEach(b => b.onclick = () => {
+      const card = b.closest('.vc');
+      const old = card.querySelector('.vc-qr');
+      if (old) { old.remove(); return; }
+      const box = document.createElement('div');
+      box.className = 'vc-qr';
+      try { box.innerHTML = qrSVG(qrMatrix(b.dataset.qr), 148); }
+      catch (e) { box.innerHTML = '<span class="note">二维码生成失败：' + esc(e.message) + '</span>'; }
+      card.appendChild(box);
+    });
+  } catch (e) {
+    body.innerHTML = '<div class="state err">' + esc(e.message) + '</div>';
+  }
+}
 
 // 按需拉取（移植上游 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
 // 账号一多既慢又压上游。有缓存先直接渲染（标注数据年龄），只有首次进入或显式刷新生效。

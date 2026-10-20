@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore:
+      - ".github/workflows/autobot.yml"
+      - "AutoBot.yml"
+      - "scripts/autobot.py"
   workflow_dispatch:
 
 permissions:
@@ -136,7 +140,9 @@ jobs:
               go build -trimpath -ldflags="-s -w" \
               -o "$app/Contents/MacOS/WorkBuddy2API" ./cmd/macosapp
             cp scripts/macos/Info.plist "$app/Contents/Info.plist"
-            cp README.md "$dir/README.md"
+            # Include the upstream standalone macOS binary alongside the app.
+            cp "$app/Contents/Resources/wb2api" "$dir/wb2api"
+            cp config.example.json README.md "$dir/"
 
             python3 - "$dir" "dist/wb2api-panel-${VERSION}-darwin-${arch}.zip" <<'PY'
           import pathlib, sys, zipfile

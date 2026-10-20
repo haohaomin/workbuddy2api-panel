@@ -87,6 +87,11 @@ func TestClassify(t *testing.T) {
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
 		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
 		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11158 是账号类型级模型权限拒绝：同一模型换有权限的账号仍可能成功，
+		// 按 (账号, 模型) 避让；不能落入 ErrClient 轮转后误报 503。
+		{400, `{"code":11158,"msg":"model [gpt-5.6-sol] is not allowed for user type [personal_free_user]"}`, ErrModelBlocked},
+		{400, `{"error":{"code":"11158","message":"model is not allowed for user type"}}`, ErrModelBlocked},
+		{429, `{"code":11158,"msg":"model is not allowed for user type"}`, ErrSoftRate},
 		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
@@ -646,8 +651,8 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			if r.Header.Get("User-Agent") != v3ProbeUACNForTest {
+				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), v3ProbeUACNForTest)
 			}
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
@@ -711,6 +716,28 @@ func TestIsModelRateLimitCodes(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("%s: IsModelRateLimit=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 区分「模型繁忙」14003 与「额度窗口用满」6004：前者没有恢复
+// 时刻，只能短窗口退避；后者带「将在 … 重置」的权威墙钟。两者混用会让一次
+// 瞬时抖动被停成十分钟（线上国际版就是这样整池冷 10 分钟）。
+func TestIsModelBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"14003 完整形态", `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"}}`, true},
+		{"14003 带空格", `{"code": 14003}`, true},
+		{"14003 字符串码", `{"code":"14003"}`, true},
+		{"6004 不是繁忙", `{"code":6004,"msg":"将在 2026-10-20 16:37:47 UTC+8 重置"}`, false},
+		{"requestId 里出现 14003 不误判", `{"code":1,"requestId":"14003abc"}`, false},
+	}
+	for _, c := range cases {
+		if got := IsModelBusy(c.body); got != c.want {
+			t.Errorf("%s: IsModelBusy=%v want %v", c.name, got, c.want)
 		}
 	}
 }

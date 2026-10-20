@@ -231,8 +231,13 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 //     与额度耗尽（14001/14002/14012/…）明确分开——它不是账号问题（xiaofan6ya 线上
 //     事故：按账号级处理时 6 个并发请求 76 秒冷掉整池 → 全站 503 十分钟）。
 //
-// ponytail: 两者共用一套模型级判定与 TTL；实测发现同一 (号,模型) 被反复停车再给 14003 独立短档。
+// ponytail: 两者共用一套模型级判定；TTL 不共用——6004 带额度窗口（有墙钟时对齐，
+// 没有时退避），14003 是瞬时繁忙，由 CooldownModelBusy 给独立短档（60s 起、封顶 3m），
+// 不套 soft_rate 的 600s→2h 阶梯。
 const modelRateLimitCodes = "6004|14003"
+
+// modelBusyCode 「当前模型请求繁忙」的业务 code（modelRateLimitCodes 的子集）。
+const modelBusyCode = "14003"
 
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
@@ -244,6 +249,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
 	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + modelRateLimitCodes + `)"?`)
+	reModelBusy       = regexp.MustCompile(`"code"\s*:\s*"?` + modelBusyCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -254,12 +260,33 @@ const softRateTimeLayout = "2006-01-02 15:04:05"
 // IsModelRateLimit 报告 body 是否明确指向模型级限流（业务 code 6004 / 14003）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
+	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差），
+	// 14003 同理。
 	return reModelRateLimit.MatchString(body)
+}
+
+// IsModelBusy 报告 body 是否是「模型繁忙」(code 14003)。
+//
+// 与 6004 的区别：6004 是额度窗口用满，带「将在 … 重置」的权威恢复时刻；
+// 14003 只是瞬时繁忙，body 里没有任何时间。前者该按上游墙钟停车，后者只能
+// 短窗口退避——套用 soft_rate（600s 起、翻倍到 2h）会把一次抖动变成十分钟
+// 不可用：一个请求轮转几个号，每个号都中 14003，几十秒内整池冷却 10 分钟。
+func IsModelBusy(body string) bool {
+	return reModelBusy.MatchString(body)
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
 const modelBlockCode = "11102"
+
+// modelForbiddenCode 明确指向「该账号类型无权使用该模型」的业务 code（上游 PR #221）。
+// 同一模型在不同账号类型上权限不同，因此与 11102 同属 (账号, 模型) 级负缓存：
+// 换有权限的账号仍可能成功，全部账号都拒绝时再向客户端报模型不可用。
+const modelForbiddenCode = "11158"
+
+const modelForbiddenMsgMarker = "is not allowed for user type"
+
+// ModelForbiddenReason 11158 负缓存条目的 reason 前缀（与 11102 分开，便于区分原因）。
+const ModelForbiddenReason = "11158 model not allowed for account type"
 
 // modelBlockMsgMarkers 11102/14401 答复的确定性文案（官方 error message 固定短语）。
 // 14401「route config not found」是图像模型的同族答复：该模型在本域没有路由，
@@ -286,18 +313,29 @@ func IsModelBlocked(status int, body string) bool {
 	}
 	// 轻量预检：body 既无 "11102" 又无 marker 时直接短路（大多数 4xx 零分配返回）。
 	lower := strings.ToLower(body)
-	if !strings.Contains(body, modelBlockCode) && !containsAnyMarker(lower, modelBlockMsgMarkers) {
+	if !strings.Contains(body, modelBlockCode) && !strings.Contains(body, modelForbiddenCode) &&
+		!containsAnyMarker(lower, modelBlockMsgMarkers) && !strings.Contains(lower, modelForbiddenMsgMarker) {
 		return false
 	}
+	code, msg := modelBlockFields(body)
+	if code == modelBlockCode || code == modelForbiddenCode {
+		return true
+	}
+	lowerMsg := strings.ToLower(msg)
+	return containsAnyMarker(lowerMsg, modelBlockMsgMarkers) ||
+		strings.Contains(lowerMsg, modelForbiddenMsgMarker)
+}
+
+// modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
+func modelBlockFields(body string) (code, msg string) {
 	var root map[string]any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
-		return false
+		return "", ""
 	}
 	nodes := []map[string]any{root}
 	if inner, ok := root["error"].(map[string]any); ok {
 		nodes = append(nodes, inner)
 	}
-	code, msg := "", ""
 	for _, node := range nodes {
 		for _, key := range []string{"code", "errCode", "error_code"} {
 			if v, ok := node[key]; ok && v != nil && code == "" {
@@ -310,10 +348,17 @@ func IsModelBlocked(status int, body string) bool {
 			}
 		}
 	}
-	if code == modelBlockCode {
-		return true
+	return code, msg
+}
+
+// ModelBlockReasonFor 返回确定性模型拒绝对应的负缓存 reason（上游 PR #221）。
+// 11158 是账号类型权限问题；其余已由 IsModelBlocked 确认的形态沿用 11102。
+func ModelBlockReasonFor(body string) string {
+	code, msg := modelBlockFields(body)
+	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
+		return ModelForbiddenReason
 	}
-	return containsAnyMarker(strings.ToLower(msg), modelBlockMsgMarkers)
+	return ModelBlockReason
 }
 
 // containsAnyMarker 任一短语命中即真（文案判定统一走这里，避免各处各写一遍循环）。
@@ -1512,24 +1557,14 @@ func generationKind(tags []string) string {
 	return ""
 }
 
-// codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
-// CLI 三段式 WorkBuddy UA 会拿到精简目录（flash 输出 128K、无 supportedEfforts）；
-// 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 才返回完整能力
-// （flash：393216 + low/high/max）。
-// 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
-const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
-
-// codeBuddyCLIUA CLI 三段式 UA。**实测（2026-09-22）该端点对不同 UA 下发的模型集合不同**：
-//   - IDE UA  → 14 条（10 个 chat：含 o4-mini / enhance-1.0 / auto-chat，**无 deepseek 系列**）
-//   - CLI UA  → 22 条（22 个 chat：**含 deepseek-v4.1-flash / deepseek-v4.1-flash-sg /
-//     gpt-6-astra / kimi-k2.8-preview**，但无 o4-mini / enhance-1.0 / auto-chat）
+// v3/config 官方客户端 UA 见 headers.go 的 v3ProbeUA / v3ProbeUALite。
 //
-// 注意两点，都与旧注释相反，勿再按旧注释推断：
-//  1. 旧注释称「CLI UA 拿到精简目录、IDE UA 才返回完整能力」——实测模型数量恰好相反，
-//     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
-//     而非模型更多。两路各有独有模型，缺一不可。
-//  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
-const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
+// 历史注记：本文件曾用 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0` 与
+// `CLI/2.63.2 CodeBuddy/2.63.2` 两套 CodeBuddy 家族常量探测该端点，理由是
+// 「该端点对不同 UA 下发不同模型集合」。结论（按 UA 家族分发不同目录）仍然成立，
+// 但 **UA 取值本身是错的**：2026-10-20 双版本 WorkBuddy 真机抓包显示，该端点收到
+// 的 UA 只有 `WorkBuddy/<ver> [<brand>/<ver>] CLI/2.161.0` 这两种形态，分发包里
+// 不存在 CodeBuddy 字面量。保留双路探测以维持目录覆盖，但两条都用官方形态。
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
@@ -1696,7 +1731,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	byID, err := c.fetchV3ConfigModelMap(a, c.v3ProbeUA(a))
 	if err != nil {
 		return nil, err
 	}
@@ -2016,7 +2051,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
 	if ua == "" {
-		ua = codeBuddyIDEUA
+		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
@@ -2406,9 +2441,11 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 // 把套餐型包的月度周期重置日当成了到期日（实测：cycle=2026-10-31，deduction=2034-12-24），
 // 首页快照因此长期错报最近到期时间与数量。
 func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, buckets []ExpiryBucket, err error) {
-	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
-	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
-	if a.IsEnterprise() {
+	// 企业版与静态 API Key 的额度都不在「个人资源包」体系内：get-user-resource*
+	// 对 enterpriseId 非空账号恒返回空 Accounts（实测 code 0 且 Accounts null），
+	// 对 ck_/pt_ 静态 Key 同样（它没有个人账号身份）。判据收在
+	// auth.UsesEnterpriseBilling 一处，避免两个包各写一遍前缀判断。
+	if a.UsesEnterpriseBilling() {
 		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(a, soon)
 		// 与个人路径同口径：企业额度查询是余额观察者（积分历史）唯一的企业入口——
 		// 企业号没有签到/任务，若此处不通知，它的余额变动将永远无迹可循。
@@ -2421,6 +2458,18 @@ func (c *Client) UserResourceSnapshot(a *auth.Auth, soon time.Duration) (remain,
 			}}
 		}
 		return
+	}
+	// global realm 个人号：官方 5.8.4 国际版已改口径，走 summary + paid/free 明细
+	// （见 billing_summary.go）。继续用下面 CN 那套分页 body 打国际站，拿回的形态
+	// 与 CN 不同（无 Accounts 树、容量是字符串小数），会解出恒 0 余额 → 积分保底
+	// 把可用号当耗尽号挡出选号。summary 失败才回落到 CN 路径（老路径兼容尝试）。
+	if a.IsGlobal() {
+		rm, tt, ex, ea, er, bk, gerr := c.globalUserResource(a, soon)
+		if gerr == nil {
+			return rm, tt, ex, ea, er, bk, nil
+		}
+		log.Printf("WARN: billing %s: global summary 失败，回落个人资源包路径: %v",
+			logfmt.Label(a.UID, a.Nickname), gerr)
 	}
 	now := time.Now()
 	body := map[string]any{

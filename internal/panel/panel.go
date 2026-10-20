@@ -189,6 +189,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.withAuth(p.addAPIKey))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -212,10 +213,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensation))
 	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAuth(p.accountTravel))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
@@ -786,8 +789,13 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
 	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
 	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	if !a.SupportsPersonalGrowth() {
+		// 静态 API Key 与企业版同列：都没有签到端点可调，但余额照旧刷新（企业口径）。
+		if a.IsAPIKey() {
+			checkinMsg = "API Key 账号无签到体系（已跳过签到，仅刷新额度）"
+		} else {
+			checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+		}
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
@@ -802,6 +810,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"ok": checkinDone, "realm": "cn", "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
+	}
+	if a.IsAPIKey() {
+		resp["api_key"] = true
 	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
@@ -901,6 +912,31 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 	go p.cfg.Scheduler.RunTravelNow()
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+}
+
+// accountTravel POST /panel/api/accounts/{uid}/travel：单号推进一趟猫猫旅行（issue #227）。
+// 与 checkin 同构——同步返回，外部调度器据此知道这一号本轮有没有动。门控在
+// Scheduler.RunTravelNowFor 里（禁用/暂停/无 refresh token/global/企业一律跳过）。
+func (p *Panel) accountTravel(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler not available")
+		return
+	}
+	uid := r.PathValue("uid")
+	if p.cfg.Pool.AuthByUID(uid) == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	ran := p.cfg.Scheduler.RunTravelNowFor(uid)
+	if !ran {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "ran": false, "skipped": true,
+			"skip_reason": "禁用/暂停/无 refresh token/国际区/企业版账号不参与旅行",
+		})
+		return
+	}
+	log.Printf("panel: 按号旅行巡检 uid=%s 完成", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ran": true})
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。

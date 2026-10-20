@@ -147,6 +147,11 @@ var autoActions = []autoAction{
 		run:      runExpertLighthouse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "无畏契约拼豆专家召唤+使用链（判据同 Expert_lighthouse；活动截止 2026-11-15）",
+		run:      runValorantExpert,
+	},
+	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
 		Attempt:  true,
@@ -639,11 +644,12 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, globalTaskWriteMessage)
 		return
 	}
-	// 企业版门控：成长端点上游 403（「growth system is only available for personal
-	// users」），执行任何成长任务都是零收益白跑，直接拒绝。
-	if a.IsEnterprise() {
+	// 无个人成长体系的账号直接拒绝：企业版成长端点上游 403（「growth system is only
+	// available for personal users」）；静态 API Key 账号（ck_/pt_）根本没有个人
+	// 账号身份。两者执行任何成长任务都是零收益白跑。
+	if !a.SupportsPersonalGrowth() {
 		writeErr(w, http.StatusUnprocessableEntity,
-			"该账号为企业版，无个人成长体系（成长端点上游 403）；请改用个人账号")
+			"该账号无个人成长体系（企业版或静态 API Key）；请改用个人账号")
 		return
 	}
 	var body struct {
@@ -1099,6 +1105,54 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 		return "", fmt.Errorf("使用事件: %w", err)
 	}
 	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+}
+
+// runValorantExpert 完成 WorkBuddy_Valorant「体验「无畏契约拼豆专家」」（+100c+5e，截止
+// 2026-11-15）。判据口径同 Expert_lighthouse：召唤链 + 真实对话 + expert_actual_use(mode=LOCAL)。
+// 专家 id ex_xQHHD1u5Jkua（agent_name=valorant-perler-expert，version 1.2.1）。
+func runValorantExpert(p *Panel, a *auth.Auth) (string, error) {
+	const vID = "ex_xQHHD1u5Jkua"
+	v := upstream.MarketExpert{
+		ExpertID: vID, ExpertType: "agent",
+		DisplayNameZH: "无畏契约拼豆专家", ProfessionZH: "无畏契约拼豆专家", Version: "1.2.1",
+	}
+	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
+	if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+		for _, e := range experts {
+			if e.ExpertID == vID {
+				v = e
+				break
+			}
+		}
+	}
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(v)...); err != nil {
+		return "", fmt.Errorf("召唤链: %w", err)
+	}
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, vID)
+	if err != nil {
+		return "", fmt.Errorf("真实对话: %w", err)
+	}
+	tail := req
+	if len(tail) > 8 {
+		tail = tail[len(tail)-8:]
+	}
+	events := upstream.DesktopChatSequence(conv, req, "msg-"+tail, "fast-model", "fast-model")
+	for _, ev := range events {
+		if ev["eventCode"] == "agent_task_created" {
+			ev["has_expert"] = true
+			ev["expert_id"] = v.ExpertID
+			ev["expert_name"] = v.DisplayNameZH
+			ev["expert_industry_id"] = ""
+		}
+	}
+	events = append(events, upstream.DesktopExpertActualUseLocal(v, conv, req))
+	// 对齐真实样本细节：actual_use 的 type 为空、cost=0（同轻量云）。
+	events[len(events)-1]["type"] = ""
+	events[len(events)-1]["cost"] = 0
+	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		return "", fmt.Errorf("使用事件: %w", err)
+	}
+	return "已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）", nil
 }
 
 // runAppearance 完成 Hp_Appearance（换主题）。

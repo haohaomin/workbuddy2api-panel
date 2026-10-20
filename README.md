@@ -321,6 +321,12 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
 
+**方式 C：静态 API Key（`ck_` / `pt_` 前缀，免登录）**
+
+面板「添加账号」→ 切到「**API Key**」标签，粘贴 CodeBuddy 平台签发的静态 Key（`ck_...` / `pt_...`）。网关先用**企业口径**额度端点探测该 Key（无效即拒绝、不落盘），成功后落盘并热加载进池，可填昵称与自定义 uid（缺省由 Key 的 id 段派生为 `apikey-<id>`）。
+
+静态 Key 与 OAuth 账号的差别是「没有个人账号身份」：**不参与**签到 / 活跃上报 / 连登 / 猫猫旅行 / 夜猫子 / 成长任务（上游对这些端点没有它的记录），**照常**参与选号派发、对话与余额查询；面板上不渲染「签到」「任务」按钮，余额走企业口径端点。
+
 ### 验证
 
 ```bash
@@ -367,6 +373,7 @@ curl -s http://localhost:7863/v1/responses \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
+| `dns_servers` | `[]` | 出站解析用的 DNS 服务器（`["223.5.5.5","119.29.29.29"]`；也可用 `WB2A_DNS` 逗号分隔覆盖）。空 = 系统解析器。给没有 `/etc/resolv.conf` 的环境用（Android 上 Go 解析器会退回 `[::1]:53`，所有域名解析失败），本地 DNS 被污染时也可借此直连可信解析器。改动需重启 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
@@ -396,6 +403,7 @@ curl -s http://localhost:7863/v1/responses \
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `upstream.user_agent` | 空 | 出站 User-Agent 覆盖（空 = 现状 `CLI/2.63.2 CodeBuddy/2.63.2`）。官网「使用端」列按出站 UA 服务端归因；官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`，需要时可配 |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `models.hidden` | `[]` | 模型黑名单：`["deepseek-pro"]` 裸名隐藏两域，`["cn:legacy-model"]` / `["global:x"]` 只隐藏该域。**列表不列 + 点名调用直接拒绝**（`/v1/models` 过滤、`/v1/chat/completions` 与 `/v1/images/*` 拒绝）——只藏列表不够，知道名字仍可硬调。面板「模型黑名单」（逗号分隔）保存后**热生效** |
 | `prompt.mode` | `custom` | 系统提示词模式：`custom` = 网关用自有提示词替换客户端 system；`append` = 开头连续 system/developer 块后插网关提示词（既有消息逐字不动）；`passthrough` = 透传客户端原始 system（降级重试仍切中性提示词） |
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
@@ -501,7 +509,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 分类 | 触发条件 | 账号处置 | 恢复 |
 |---|---|---|---|
 | 余额不足 | HTTP 402 / body 含余额关键词 | 硬冷却到**次日 04:00**（本地时区） | 签到（09/21 点）余额恢复自动解冻 |
-| 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**`code 6004`（模型级）带「将在 … 重置」时**冷却到上游重置墙钟并豁免切模型（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
+| 频控 | HTTP 429 / 限流文案（不限状态码） | 软冷却 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）。**模型级 `code 6004` / `14003`** 只停 (账号, 模型)、豁免切模型：`6004` 带「将在 … 重置」时对齐上游墙钟，`14003`（模型繁忙）用独立短窗口 60s 起、封顶 3 分钟（见[常见问题](#429-code6004模型级限流的冷却语义)） | 到期自动恢复 / 成功清零退避 |
 | Session 失效 | body 含 `Offline user session not found` / `12153` | **连续 3 次**才永久禁用（一次 12153 多为临时抖动：网络 / 闪断 / refresh 竞态）；刷新成功 / 任意成功 / 手工复活清计数 | 人工重新登录（`login.sh`）或 `ReviveDisabled` 复活 |
 | 网关 401（token 被上游判无效） | HTTP 401 + **无业务信封**（APISIX/openresty `401 Authorization Required` HTML 页，响应头 `WWW-Authenticate: … error="invalid_token"`） | 归 Session 失效，**连续 3 次**禁用，禁用原因写 `401 invalid token (re-login required)` 以区别 12153 —— 这类 token 的 refresh 也回 `invalid_grant`（`Session doesn't have required client` / `Refresh token issued before the user session started`），刷新救不活，只能重登 | 人工重新登录（`login.sh` / 面板「添加账号」） |
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
@@ -515,6 +523,8 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
 **软冷却指数退避**（与熔断器并存的第二条升级线）：软限流的**冷却时长**本身也按连续次数退避——同一账号连续触发软冷却时 `soft_rate × 2^(连续次数-1)`，封顶 `soft_rate_max`。计数 `soft_streak` 独立于熔断器的 `fails`，只在**成功**时清零（签到/余额刷新不参与——限流的恢复证据是上游重置墙钟，不是余额恢复），随 `state.json` 持久化。
+
+模型级限流（`6004` / `14003`）不占这条账号级升级线：只停 (账号, 模型)，账号级 `until` 与 `soft_streak` 全程不动；其中 `14003`（模型繁忙）用独立短窗口（60s 起、封顶 3 分钟）。
 
 ### 选号策略
 
@@ -714,7 +724,7 @@ http://127.0.0.1:7863/panel/
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持关键词与结果筛选、读取条数，以及 今天 / 近 24 小时 / 近 7 天 / **自定义区间**等**时间范围**查询（由归档侧按时间取，不是筛已拉取的条目）+ 最近 500 行服务日志（按任务 / 对话 / 系统分频道，可开关自动滚动），并新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
+`models.hidden`、`logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`、`admin`、`metrics`、`alerting`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
@@ -917,11 +927,12 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 429 code=6004（模型级限流）的冷却语义？
 
-上游 `429` + `code 6004` 是**该模型的使用量超限**（msg 通常带「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」），**不是账号整体被限流**。网关的处理：
+上游 `429` + `code 6004` / `code 14003` 都是**模型级**信号，**不是账号整体被限流**：账号健康，只是这个模型此刻不可用（同号换模型立即可用）。
 
-- **冷却到上游重置时间**：msg 带「将在 … 重置」时，账号冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
-- **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
-- **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
+- **6004 冷却到上游重置时间**：msg 带「将在 … 重置」时，该模型的冷却 `until` 精确等于该墙钟（按 UTC+8 解释），并封顶 `soft_rate_max`（默认 2h）
+- **14003 用独立短窗口**：`14003` 的 msg 是 `too many requests`、displayMsg「模型繁忙，请换模型或稍后重试」，body 里**没有**恢复时刻。它只停 (账号, 模型) 60s 起，按命中次数翻倍、封顶 3 分钟；不套 `soft_rate` 的 600s→2h 阶梯（否则一次瞬时抖动就变成十分钟不可用）
+- **切模型立即可用**：冷却由 6004/14003 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用
+- **只有其余 429 才走账号级指数退避**：非 6004/14003 的普通软限流（或没有模型名的场景）→ `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
 ### 多图会话请求体超限怎么办？
 

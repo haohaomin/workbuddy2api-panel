@@ -46,11 +46,12 @@ func (p *Panel) scanAccountGrowth(a *auth.Auth) scanAccountItem {
 		it.SkipReason = "国际区任务仅支持查询，不执行国内区成长任务"
 		return it
 	}
-	// 企业版门控：企业版无个人成长体系（GET /v2/activity/growth/tasks 上游 403
-	// 「growth system is only available for personal users」），不发任何上游调用。
-	if a.IsEnterprise() {
+	// 无个人账号体系的账号不发任何上游调用：企业版任务端点上游 403（「growth system
+	// is only available for personal users」）；静态 API Key 账号没有个人身份，
+	// 列表与领取同样无意义。
+	if !a.SupportsPersonalEndpoints() {
 		it.Skipped = true
-		it.SkipReason = "企业版无个人成长体系（任务端点上游 403）"
+		it.SkipReason = "无个人成长体系（企业版或静态 API Key）"
 		return it
 	}
 	var errors []string
@@ -551,4 +552,55 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 		"seq":        q.seq,
 		"items":      items,
 	})
+}
+
+// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
+// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+		Err      string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, st := range accts {
+		if st.Disabled {
+			continue // 未占位，行末统一压掉
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(i int, a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			it := row{UID: a.UID, Nickname: a.Nickname}
+			switch {
+			case a.IsGlobal():
+				it.Err = "global realm（无开学季活动）"
+			default:
+				vs, err := p.cfg.Upstream.SchoolVouchers(a)
+				if err != nil {
+					it.Err = err.Error()
+				} else {
+					it.Vouchers = vs
+				}
+			}
+			out[i] = it
+		}(i, a)
+	}
+	wg.Wait()
+	res := make([]row, 0, len(out))
+	for _, it := range out {
+		if it.UID != "" {
+			res = append(res, it)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": res})
 }
