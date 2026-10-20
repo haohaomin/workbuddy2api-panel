@@ -114,7 +114,15 @@ jobs:
 
   build-macos:
     needs: version
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: amd64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
@@ -128,23 +136,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for arch in arm64 amd64; do
-            dir="dist/darwin-${arch}"
-            app="$dir/WorkBuddy2API.app"
-            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          arch="${{ matrix.arch }}"
+          dir="dist/darwin-${arch}"
+          app="$dir/WorkBuddy2API.app"
+          bash scripts/macos/build-app.sh "$arch" "$app"
+          bash scripts/macos/test-updater.sh "$app"
+          python3 scripts/macos/package-update.py "$app" \
+            "dist/wb2api-panel-${VERSION}-darwin-${arch}-update.zip"
+          # Include the upstream standalone macOS binary alongside the app.
+          cp "$app/Contents/Resources/wb2api" "$dir/wb2api"
+          cp config.example.json README.md "$dir/"
 
-            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
-              go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" \
-              -o "$app/Contents/Resources/wb2api" ./cmd/server
-            CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
-              go build -trimpath -ldflags="-s -w" \
-              -o "$app/Contents/MacOS/WorkBuddy2API" ./cmd/macosapp
-            cp scripts/macos/Info.plist "$app/Contents/Info.plist"
-            # Include the upstream standalone macOS binary alongside the app.
-            cp "$app/Contents/Resources/wb2api" "$dir/wb2api"
-            cp config.example.json README.md "$dir/"
-
-            python3 - "$dir" "dist/wb2api-panel-${VERSION}-darwin-${arch}.zip" <<'PY'
+          python3 - "$dir" "dist/wb2api-panel-${VERSION}-darwin-${arch}.zip" <<'PY'
           import pathlib, sys, zipfile
 
           directory = pathlib.Path(sys.argv[1])
@@ -155,17 +158,16 @@ jobs:
                       z.write(path, pathlib.Path(directory.name) / path.relative_to(directory))
           PY
 
-            stage="$(mktemp -d)"
-            cp -R "$app" "$stage/WorkBuddy2API.app"
-            ln -s /Applications "$stage/Applications"
-            hdiutil create -quiet -volname WorkBuddy2API -srcfolder "$stage" \
-              -ov -format UDZO "dist/wb2api-panel-${VERSION}-darwin-${arch}.dmg"
-            rm -rf "$stage"
-          done
+          stage="$(mktemp -d)"
+          cp -R "$app" "$stage/WorkBuddy2API.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -quiet -volname WorkBuddy2API -srcfolder "$stage" \
+            -ov -format UDZO "dist/wb2api-panel-${VERSION}-darwin-${arch}.dmg"
+          rm -rf "$stage"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wb2api-panel-${{ env.VERSION }}-darwin
+          name: wb2api-panel-${{ env.VERSION }}-darwin-${{ matrix.arch }}
           path: dist
           if-no-files-found: error
 
@@ -187,8 +189,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/macos/update-manifest.py "$VERSION" release-assets
           mapfile -t files < <(find release-assets -type f \( -name '*.zip' -o -name '*.dmg' \) -print | sort)
           [ "${#files[@]}" -gt 0 ]
-          gh release create "v${VERSION}" "${files[@]}" \
+          gh release create "v${VERSION}" "${files[@]}" release-assets/macos-update.json \
             --title "v${VERSION}" \
-            --generate-notes
+            --generate-notes --draft --verify-tag
+          # Make the release discoverable only after every asset and manifest is uploaded.
+          gh release edit "v${VERSION}" --draft=false --latest

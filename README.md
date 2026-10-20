@@ -286,7 +286,37 @@ go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
-### 方式三：源码运行（开发调试）
+### 方式三：macOS 应用（DMG）
+
+下载 Release 中的 `darwin-arm64.dmg`（Apple 芯片）或 `darwin-amd64.dmg`（Intel），将 **WorkBuddy2API.app** 拖入「应用程序」，双击打开。
+
+- 应用会保留一个控制窗口，并自动启动本地服务；点击「打开面板」进入浏览器管理账号。
+- 「停止服务」停止后台进程，窗口仍然保留；点击「启动服务」可再次运行。
+- 点击红色关闭按钮、「退出应用」或按 `⌘Q`，都会停止本应用启动的服务并退出。最小化窗口不会停止服务。
+- 窗口显示服务状态；遇到启动错误，可点击「查看日志」。如果地址已被其他实例占用，先退出旧实例，再点击「启动服务」。
+- 配置、账号和日志保存在 `~/Library/Application Support/WorkBuddy2API/`，更新或退出应用不会删除这些数据。
+
+**一键更新**：控制窗口显示当前版本，点击「检查更新」，发现新版后点击「更新并重启」。启动、重新聚焦窗口（距上次检查超过一小时）及每六小时会自动检查；自动检查不下载、不安装，网络失败不阻塞服务。下载期间显示进度且可取消；取消后迟到的网络响应不会继续安装。服务在下载期间继续运行，校验通过后才停止服务、替换应用并重新启动；更新前已停止服务的，更新后也保持停止。
+
+更新源固定为本 fork `haohaomin/workbuddy2api-panel` 的 `releases/latest/download/macos-update.json` 清单，避免正常检查占用匿名 API 配额。旧 Release 尚无清单时回退 GitHub Latest Release API；限流会明确提示稍后重试。客户端只接受匹配芯片架构的 `*-darwin-<arch>-update.zip`，使用清单（或旧版 API）返回的 SHA-256 摘要检查下载完整性，并校验压缩包路径、应用标识、版本、架构及 macOS 代码签名完整性。当前采用 ad-hoc 代码签名，**不具备独立发布者公钥签名或 Apple 公证**；发布来源的信任依赖 GitHub HTTPS 和该仓库权限。客户端不会移除系统隔离属性或绕过 Gatekeeper。
+
+替换助手等待旧应用退出，通过 macOS 原子交换切换应用，避免安装路径短暂缺失，并通过安装锁阻止两个更新助手并发替换。旧版保存在安装目录的 `.WorkBuddy2API-update-<UUID>/backup/WorkBuddy2API.app`，再启动新版并等待就绪确认。启动失败时恢复旧版；旧版备份不会在确认前删除，成功后也保留供手动恢复。更新成功或回滚结果会保留显示；窗口提供「发布说明」「更新日志」入口。旧进程退出后如再校验失败，也会重新打开原应用。安装日志位于数据目录的 `data/updater.log`。更新器只替换 `.app`，不迁移或删除账号、配置和运行数据。安装目录不可写时会报告错误并保留当前安装，请先将应用放入可写的「应用程序」目录。
+
+旧 Release 没有专用更新包时，会提示尚未提供兼容包，不会安装旧启动器或任意 ZIP。发布工作流在下一次时间标签发布时生成两个架构的更新包；本地 `dev` 构建可手动选择安装正式版本。
+
+本地构建需要 Go 和 Xcode Command Line Tools（`xcode-select --install`）：
+
+```bash
+bash scripts/macos/build-app.sh arm64  # Intel 使用 amd64
+open dist/WorkBuddy2API.app
+bash scripts/macos/test-updater.sh dist/WorkBuddy2API.app
+# 本地 GUI 会话可额外验证真实替换、重启与回滚（仅操作临时应用副本）：
+python3 tests/macos/test-handoff.py dist/WorkBuddy2API.app
+```
+
+本地构建显示 `dev`；发布工作流通过标签注入版本号，并使用同一脚本构建应用。
+
+### 方式四：源码运行（开发调试）
 
 ```bash
 go build ./...
