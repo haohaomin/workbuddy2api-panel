@@ -19,6 +19,7 @@ CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" \
 xcrun swiftc -swift-version 5 -O -target "${swift_arch}-apple-macosx12.0" \
   -framework AppKit cmd/macosapp/*.swift -o "$app/Contents/MacOS/WorkBuddy2API"
 cp scripts/macos/Info.plist "$app/Contents/Info.plist"
+cp scripts/macos/assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 if [ -n "${VERSION:-}" ]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "$app/Contents/Info.plist"
