@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
@@ -216,7 +217,7 @@ var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
-var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
+var softRateResetLoc = cst.Loc
 
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
@@ -778,6 +779,13 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
+	// DumpRequestMax 落盘文件里出站请求体片段的上限（字节）；0 = 默认 256 KB。
+	// 见 dump.go。
+	DumpRequestMax int
+	// DumpDir 非空时把每次 chat 请求的出站报文与上游原始响应落盘（诊断用，
+	// 见 dump.go）。启动后只读，空 = 不落盘。
+	DumpDir string
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -958,10 +966,10 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-// 返回改写后的请求体与本次实际生效的思考档位（见 normalizeReasoningEffort）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]byte, string) {
+// 返回改写后的请求体、客户端原始请求档位与本次实际生效档位
+// （requested 与 effective 的区别见 prepareBodyOpt 注释；issue #43）。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]byte, string, string) {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	maxOut := c.modelMaxOutSnapshot(realm)
 	if realmKey(realm) == "global" {
@@ -973,8 +981,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。与 body 归一化共用
 	// prepareBodyOpt 的同一次 map 解析，不再二次 Unmarshal/Marshal。
-	body, effort := prepareBodyOpt(body, c.SanitizeFingerprints.Load(), efforts, defs, maxOut, uid, conversationID, true)
-	return body, effort
+	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), efforts, defs, maxOut, uid, conversationID, true)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1346,10 +1353,11 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		ctx = context.Background()
 	}
 	prepStart := time.Now()
-	prepared, effort := c.prepareBody(body, a.Realm(), a.UID, cacheKeySource(meta))
+	prepared, requested, effort := c.prepareBody(body, a.Realm(), a.UID, cacheKeySource(meta))
 	if timing != nil {
 		timing.Prep += time.Since(prepStart)
-		timing.Effort = effort // 生效思考档位（客户端未携带该字段时为空）
+		timing.RequestedEffort = requested // 客户端原始档位（未携带 → 空）
+		timing.Effort = effort             // 生效档位（可能被降级；空 = 未参与降级）
 	}
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
@@ -1410,7 +1418,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		body := c.dumpUpstream(monitorBody(resp.Body, c.IdleTimeout, cancel), prepared, a)
+		return body, resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
@@ -1427,15 +1436,20 @@ type ModelInfo struct {
 	DefaultEffort string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
 
 	// 模型目录全字段（models-full-fields）：
-	Description       string   // descriptionZh 中文描述
-	Credits           string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
-	Tags              []string // tags 模型标签（含 badge:限时免费 等）
-	Vendor            string   // vendor 厂商标识
-	IsDefault         bool     // isDefault 是否默认模型
-	SupportsReasoning bool     // supportsReasoning 是否支持推理
-	SupportsToolCall  bool     // supportsToolCall 是否支持工具调用
-	OnlyReasoning     bool     // onlyReasoning 是否纯推理模型
-	SupportsImages    bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	Description string   // descriptionZh 中文描述
+	Credits     string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
+	Tags        []string // tags 模型标签（含 badge:限时免费 等）
+	// Tier /v3/config data.modelTiers 的官方标识文案（global「Pro Only」/ CN
+	// 「订阅优先」），空=不受限。只透文案不给布尔：海外是 Pro 专属（免费号调不通），
+	// 国内只是「优先调度」（能用，排队靠后），同一个 requiredUserType 两种语义，
+	// 一刀切成「不可用」会把国内这三个模型错标成禁选（issue #235）。
+	Tier              string
+	Vendor            string // vendor 厂商标识
+	IsDefault         bool   // isDefault 是否默认模型
+	SupportsReasoning bool   // supportsReasoning 是否支持推理
+	SupportsToolCall  bool   // supportsToolCall 是否支持工具调用
+	OnlyReasoning     bool   // onlyReasoning 是否纯推理模型
+	SupportsImages    bool   // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 	// SupportsImagesSet 上游是否**显式**给过 supportsImages。缺失与显式 false 必须分开：
 	// 缺失 = 上游没声明这项能力（多为非对话/旁路模型），据此断言「不支持图片」是编造
 	// 能力事实，gateway_hint 只能退中性文案（见 hint.go）。
@@ -1817,7 +1831,7 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 			}
 		}
 		if len(sc.Daily) > 0 {
-			cur := now.Hour()*60 + now.Minute()
+			cur := now.In(cst.Loc).Hour()*60 + now.Minute()
 			inWindow := false
 			for _, w := range sc.Daily {
 				st, ok1 := promoClock(w.Start)
@@ -1841,6 +1855,45 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// v3ModelTier /v3/config data.modelTiers 单条付费层级（issue #235 实测两域各一条）：
+// 一层级带一组 modelIds + 官方标识文案。只取 label —— requiredUserType 两域同值
+// （"standard"）语义却不同，不能拿来判「能不能调」，判了就会误标。
+type v3ModelTier struct {
+	Enabled  bool     `json:"enabled"`
+	Priority int      `json:"priority"`
+	ModelIDs []string `json:"modelIds"`
+	Badge    *struct {
+		Label string `json:"label"`
+	} `json:"badge"`
+}
+
+// applyModelTiers 给受限模型挂官方标识文案（同模型多条命中取 priority 最高）。
+// 只标注不过滤：一次 /v1/models 是全池共享的，而层级是账号级属性，在列表接口上
+// 没有「当前账号」，硬过滤会按池里最差的号降级掉所有人的选择。
+func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
+	if len(tiers) == 0 || len(out) == 0 {
+		return
+	}
+	best := map[string]int{}
+	for _, t := range tiers {
+		if !t.Enabled || t.Badge == nil || strings.TrimSpace(t.Badge.Label) == "" {
+			continue
+		}
+		for _, id := range t.ModelIDs {
+			mi, ok := out[id]
+			if !ok {
+				continue // 目录外模型（如已下架）不挂
+			}
+			if p, seen := best[id]; seen && p >= t.Priority {
+				continue
+			}
+			best[id] = t.Priority
+			mi.Tier = t.Badge.Label
+			out[id] = mi
+		}
+	}
 }
 
 // applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
@@ -2084,6 +2137,10 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 				} `json:"ModelTrialBanner"`
 			} `json:"productFeaturesConfig"`
 			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
+			// ModelTiers 付费层级表（issue #235）：海外「Pro Only」= 专业版专属
+			// （免费号选了就报错），国内「订阅优先」= 仅排队优先。清单与文案都在这，
+			// 模型目录本身不会按账号权限裁剪。
+			ModelTiers []v3ModelTier `json:"modelTiers"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -2132,6 +2189,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
 	applyModelPromotions(out, env.Data.ModelPromotions)
+	applyModelTiers(out, env.Data.ModelTiers)
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")

@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 首屏主题预热：必须留在样式表之前、且是同步外链脚本。
+     html 根节点上的 data-theme="dark" 只是无脚本兜底；真实偏好在 localStorage，
+     只有 body 末尾的 app.js 才读它——那样第一帧已经按深色画完了，刷新就会
+     「先闪一下夜间模式」。theme.js 把判定提到样式表解析之前，见文件头注释。 -->
+<script src="theme.js"></script>
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
@@ -1077,6 +1082,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="task_sweep_minutes" type="number" min="1" placeholder="15"></label>
             </div>
             <div class="hr"></div>
+            <div class="grid2">
+              <label class="fld"><span class="lb">账号摊开窗口（分钟）</span>
+                <input name="account_spread_minutes" type="number" min="0" max="1440" placeholder="0">
+                <span class="hint">0 = 关闭（同一秒打全池）。&gt;0 时签到 / 旅行 / 活跃上报 / 保活 / 夜猫子把账号错开在窗口内各自的时刻。手动触发不受影响。窗口应小于相邻时点间隔。</span></label>
+              <label class="fld"><span class="lb">账号最小间隔（秒）</span>
+                <input name="account_spread_min_gap_seconds" type="number" min="0" max="3600" placeholder="0">
+                <span class="hint">0 = 只做随机。两个账号撞在同一时段时把后者推开；账号数 × 该值接近窗口时末尾会挤在一起。</span></label>
+            </div>
+            <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
             <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
@@ -1128,6 +1142,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">积分保底</span>
                 <input name="credit_floor" type="number" min="0" placeholder="100">
                 <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
+              <label class="fld"><span class="lb">保底倍率上限</span>
+                <input name="credit_floor_max_rate" type="number" min="0" step="0.01" placeholder="0">
+                <span class="hint">无实测账本时，目录倍率 ≤ 此值才放行（让便宜新模型跑出第一笔账本）；0 = 任何已知收费倍率都拦</span></label>
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
                 <span class="hint">窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</span></label>
@@ -1168,6 +1185,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">模型黑名单</span>
                 <input name="models_hidden" placeholder="deepseek-pro, cn:legacy-model">
                 <span class="hint">逗号分隔；裸名隐藏两域，cn: / global: 只隐藏该域；/v1/models 不列且点名调用直接拒绝，保存即热生效</span></label>
+              <label class="fld"><span class="lb">模型映射</span>
+                <input name="models_aliases" placeholder="claude-opus-4=glm-5.2, gpt-5=global:gpt-5.4">
+                <span class="hint">逗号分隔的「客户端名=真实模型名」；真实名可带 cn:/global: 前缀跨域指向；响应回显客户端原发名；目标仍受黑名单约束，保存即热生效</span></label>
             </div>
 
             <div class="hr"></div>

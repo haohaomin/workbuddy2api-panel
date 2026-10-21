@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Config 顶层配置。
@@ -111,6 +112,14 @@ type Config struct {
 		GrowthConcurrency int `json:"growth_concurrency"`
 		// JitterMinutes 0 = 精确整点。正值把触发时刻摊在该窗口内，同一小时偏移固定。
 		JitterMinutes int `json:"jitter_minutes"`
+		// AccountSpreadMinutes 账号级摊开窗口（issue #45）：0 = 关闭（同一秒打全池）。
+		// >0 时排程触发的签到 / 旅行 / 活跃上报 / 保活 / 夜猫子把每个账号放在窗口内
+		// 各自的偏移上（按 账号+任务+日期 哈希，当天固定），面板手动触发不受影响。
+		// 窗口应小于相邻时点的间隔，否则上一批会跨过下一个时点。
+		AccountSpreadMinutes int `json:"account_spread_minutes"`
+		// AccountSpreadMinGapSeconds 同批两个账号的最小间隔（偏移撞车时把后者推开）。
+		// 0 = 只做随机。账号数 × 该值接近窗口时末尾会挤在一起。
+		AccountSpreadMinGapSeconds int `json:"account_spread_min_gap_seconds"`
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -172,6 +181,13 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// DumpDir 非空时把 chat 请求的出站报文 + 上游原始响应落盘（诊断用，见
+		// internal/upstream/dump.go）。默认空 = 不落盘：正文含用户提示词。
+		DumpDir string `json:"dump_dir"`
+		// DumpMaxBytes 落盘文件里「出站请求体」片段的上限，默认 262144（256 KB）。
+		// 长会话把 tools 定义排在几百条 messages 之后，256 KB 常在中途截断，
+		// 排障时看不到工具声明（issue #44 的反馈）。0 = 用默认值。
+		DumpMaxBytes int `json:"dump_max_bytes"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -184,6 +200,14 @@ type Config struct {
 		// 生效点：GET /v1/models 列表过滤 + POST /v1/chat/completions 点名拒绝
 		// （只藏列表不够——知道名字仍可硬调）。面板保存后经 livecfg 热生效，无需重启。
 		Hidden []string `json:"hidden"`
+		// Aliases 模型映射表（issue #30）："客户端名=真实模型名" 条目数组，与 Hidden
+		// 同存储形态（数组整体覆盖，面板删条目无需重启）。键：裸名=两域生效，
+		// "cn:x"/"global:x"=只在该域生效；键大小写不敏感。值可带 realm 前缀实现跨域
+		// 指向（"my-glm": "global:glm-5.2"）。生效点：chat 请求解析 realm/裸名之后、
+		// 隐藏检查/选号/出站 body 之前整体替换；被映射到的目标仍受 Hidden 约束
+		// （别名不能绕过黑名单）。响应/日志/账本按实际生效模型名口径。
+		// 面板保存后经 livecfg 热生效，无需重启。
+		Aliases []string `json:"aliases"`
 	} `json:"models"`
 
 	Prompt struct {
@@ -249,9 +273,14 @@ type Config struct {
 		AccountShare    map[string]float64 `json:"account_share"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
-		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
-		// 默认 0 = 关闭；负值钳 0。
+		// tier 0（免费）不受限；tier 1（无观测）按目录倍率分档：≤ 下面的
+		// CreditFloorMaxRate 放行（让便宜新模型跑出第一笔账本），更高的仍拦。
+		// 签到回血越过 floor 自动恢复。默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorMaxRate 保底兜底允许的目录倍率上限（issue #30 / PR #2）。
+		// 0.2 = 便宜模型（x0.11 这类）在触底号上放行入账，x1.62 这类仍按收费拦。
+		// 0 = 严格模式（任何已知正倍率都拦）；负值钳 0。面板「积分保底」档位旁可改。
+		CreditFloorMaxRate float64 `json:"credit_floor_max_rate"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -398,7 +427,9 @@ func Load(path string) (*Config, error) {
 				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
 				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
 		}
-		raw, err := os.ReadFile(path)
+		// safefile：正文坏（掉电留下全 0 / 半截）时回退 config.json.bak，
+		// 两边都坏才报错——不再让「配置损坏」直接变成起不来。
+		raw, err := safefile.Read(path, nil)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
@@ -519,6 +550,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
 		c.Upstream.DeviceTokenFile = v
 	}
+	if v := os.Getenv("WB2A_DUMP_UPSTREAM"); v != "" {
+		c.Upstream.DumpDir = v
+	}
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Upstream.PassthroughIP = b
@@ -541,6 +575,16 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SCHEDULE_JITTER_MINUTES"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Schedule.JitterMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.AccountSpreadMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.AccountSpreadMinGapSeconds = n
 		}
 	}
 	if v := os.Getenv("WB2A_ADMIN_ENABLED"); v != "" {
@@ -601,6 +645,8 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_PROMPT_MODE", "prompt.mode", ""}, {"WB2A_PROMPT_FILE", "prompt.file", ""},
 		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
 		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
+		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES", "schedule.account_spread_minutes", "int"},
+		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS", "schedule.account_spread_min_gap_seconds", "int"},
 		{"WB2A_ADMIN_ENABLED", "admin.enabled", "bool"}, {"WB2A_ADMIN_AUDIT_ENABLED", "admin.audit_enabled", "bool"},
 		{"WB2A_ADMIN_AUDIT_FILE", "admin.audit_file", ""},
 		{"WB2A_METRICS_ENABLED", "metrics.enabled", "bool"},
@@ -720,6 +766,11 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 保底倍率上限：负值钳 0（= 严格模式，任何已知正倍率都拦）。
+	// 不设非零默认是有意的——这是钱相关开关，升级不该静默放宽既有防护。
+	if c.Pool.CreditFloorMaxRate < 0 {
+		c.Pool.CreditFloorMaxRate = 0
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -808,6 +859,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Schedule.JitterMinutes < 0 || c.Schedule.JitterMinutes > 1440 {
 		return fmt.Errorf("schedule.jitter_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.JitterMinutes)
+	}
+	if c.Schedule.AccountSpreadMinutes < 0 || c.Schedule.AccountSpreadMinutes > 1440 {
+		return fmt.Errorf("schedule.account_spread_minutes: %d 非法（0 = 关闭，上限 1440）", c.Schedule.AccountSpreadMinutes)
+	}
+	if c.Schedule.AccountSpreadMinGapSeconds < 0 || c.Schedule.AccountSpreadMinGapSeconds > 3600 {
+		return fmt.Errorf("schedule.account_spread_min_gap_seconds: %d 非法（0 = 只做随机，上限 3600）", c.Schedule.AccountSpreadMinGapSeconds)
 	}
 	if c.Budget.DailyCreditLimit < 0 {
 		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 不限", c.Budget.DailyCreditLimit)

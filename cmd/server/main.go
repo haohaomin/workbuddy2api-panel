@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -110,6 +111,7 @@ func main() {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetReserveCredits(*cfg.Pool.ReserveCredits) // 保留积分：余额低于阈值停止接单（0 = 关闭，缺省 10）
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
@@ -176,6 +178,8 @@ func main() {
 	up.ClientName = cfg.Upstream.ClientName
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	up.DumpDir = cfg.Upstream.DumpDir
+	up.DumpRequestMax = cfg.Upstream.DumpMaxBytes
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
@@ -209,6 +213,11 @@ func main() {
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		JitterMinutes:          cfg.Schedule.JitterMinutes,
+		// 账号级摊开（issue #45）：默认 0/0 = 关闭，同一秒打全池。
+		AccountSpreadMinutes:       cfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: cfg.Schedule.AccountSpreadMinGapSeconds,
+		// 启动补跑去重：与 state.json 同目录，重启多次只在当天补一轮。
+		RunStampFile: filepath.Join(filepath.Dir(cfg.StateFile), "task-runs.json"),
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -249,6 +258,10 @@ func main() {
 	if cfg.Schedule.JitterMinutes > 0 {
 		log.Printf("排程抖动：各任务在名义整点后 0-%d 分钟（schedule.jitter_minutes）", cfg.Schedule.JitterMinutes)
 	}
+	if cfg.Schedule.AccountSpreadMinutes > 0 {
+		log.Printf("账号摊开：账号遍历型任务在 %d 分钟内按账号错开，最小间隔 %d 秒（schedule.account_spread_minutes）",
+			cfg.Schedule.AccountSpreadMinutes, cfg.Schedule.AccountSpreadMinGapSeconds)
+	}
 	switch {
 	case !cfg.Schedule.BalanceRefreshEnabled:
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
@@ -274,6 +287,7 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		ModelAliases:         livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -382,11 +396,13 @@ func main() {
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
-		ModelsHidden:   cfg.Models.Hidden,
-		AdminEnabled:   cfg.Admin.Enabled,
-		MetricsEnabled: cfg.Metrics.Enabled,
-		Tasks:          sch,
-		Audit:          auditLog,
+		ModelsHidden: cfg.Models.Hidden,
+		// 模型映射原始条目（issue #30）；同上，运行期以 livecfg 快照为准。
+		ModelsAliases:    cfg.Models.Aliases,
+		AdminEnabled:     cfg.Admin.Enabled,
+		MetricsEnabled:   cfg.Metrics.Enabled,
+		Tasks:            sch,
+		Audit:            auditLog,
 		BudgetLimit:      cfg.Budget.DailyCreditLimit,
 		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
 		CacheLowRate:     cfg.Budget.CacheLowRate,
@@ -619,30 +635,29 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		// 配置所在目录不可写：Docker 里 /app 属主是镜像内的 app(10001)，而 compose 让
-		// 容器以 PUID(如 1000) 运行 —— 挂载进去的 config.json 可写、目录不行，于是原子
-		// 替换连 tmp 都建不出来（issue #134：write config: open /app/config.json.tmp:
-		// permission denied）。文件本身可写就退回原地重写，不再要求目录可写。
-		if !errors.Is(err, fs.ErrPermission) {
+	// safefile：tmp fsync 后才 rename，并把上一份有效配置留成 config.json.bak
+	// —— 掉电把 config.json 留成半截时，下次启动能捡回上一份。
+	if err := safefile.WriteKeep(path, out, 0o600); err != nil {
+		switch {
+		case errors.Is(err, fs.ErrPermission):
+			// 配置所在目录不可写：Docker 里 /app 属主是镜像内的 app(10001)，而 compose 让
+			// 容器以 PUID(如 1000) 运行 —— 挂载进去的 config.json 可写、目录不行，于是原子
+			// 替换连 tmp 都建不出来（issue #134：write config: open /app/config.json.tmp:
+			// permission denied）。文件本身可写就退回原地重写，不再要求目录可写。
+			if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("write config (目录不可写，原地重写也失败): %w", inPlaceErr)
+			}
+		case errors.Is(err, syscall.EBUSY):
+			// A single-file Docker bind mount cannot be renamed over its mount
+			// target (Linux returns EBUSY / "device or resource busy"). Keep the
+			// atomic path for regular files, but update the mounted file in place
+			// for this specific deployment shape.
+			if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("replace config (bind mount fallback): %w", inPlaceErr)
+			}
+		default:
 			return nil, fmt.Errorf("write config: %w", err)
 		}
-		if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
-			return nil, fmt.Errorf("write config (目录不可写，原地重写也失败): %w", inPlaceErr)
-		}
-	} else if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", inPlaceErr)
-		}
-		_ = os.Remove(tmp)
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
@@ -652,6 +667,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -661,6 +677,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
+	p.SetCreditFloorMaxRate(newCfg.Pool.CreditFloorMaxRate) // 保底倍率上限热生效（0 = 严格模式）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring, newCfg.ExpiringSoonDur)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
@@ -683,7 +700,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		GrowthDisabled:         !newCfg.Schedule.GrowthEnabled,
 		IncludeDisabledInTasks: newCfg.Schedule.IncludeDisabledInTasks,
 
-		JitterMinutes: newCfg.Schedule.JitterMinutes,
+		JitterMinutes:              newCfg.Schedule.JitterMinutes,
+		AccountSpreadMinutes:       newCfg.Schedule.AccountSpreadMinutes,
+		AccountSpreadMinGapSeconds: newCfg.Schedule.AccountSpreadMinGapSeconds,
 	})
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
