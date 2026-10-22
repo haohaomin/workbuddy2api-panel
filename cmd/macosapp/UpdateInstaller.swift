@@ -13,6 +13,7 @@ struct InstallPlan: Codable {
     var staged: URL { directory.appendingPathComponent("WorkBuddy2API.app") }
     var backup: URL { directory.appendingPathComponent("backup/WorkBuddy2API.app") }
     var receipt: URL { directory.appendingPathComponent("ready.json") }
+    var launcherReceipt: URL { directory.appendingPathComponent("launcher-ready.json") }
     var file: URL { directory.appendingPathComponent("plan.json") }
 
     func validate() throws {
@@ -47,6 +48,25 @@ struct UpdateReceipt: Codable {
 // The helper is a copy of the currently trusted launcher, outside the bundle
 // being replaced. It runs without AppKit and never writes the user's data tree.
 enum UpdateInstaller {
+    // Foundation launches each Process in its own process group on macOS.
+    // Before exec, put the update's server back in the launcher's group so the
+    // helper can clean up both even if the launcher crashes before its receipt.
+    static func runUpdateServer(_ arguments: [String]) -> Never {
+        let parent = getppid()
+        guard !arguments.isEmpty, parent > 1, getpgid(parent) == parent,
+              setpgid(0, parent) == 0 else {
+            fputs("Cannot join the update launcher's process group.\n", stderr)
+            exit(2)
+        }
+        let strings = arguments.map { strdup($0) }
+        var argv = strings + [nil]
+        argv.withUnsafeMutableBufferPointer { buffer in
+            _ = execv(arguments[0], buffer.baseAddress!)
+        }
+        fputs("Cannot execute the update's server.\n", stderr)
+        exit(2)
+    }
+
     static func load(_ path: String) throws -> InstallPlan {
         let plan = try JSONDecoder().decode(InstallPlan.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
         guard plan.file.path == path else { throw UpdateFailure("更新计划路径无效。") }
@@ -54,12 +74,13 @@ enum UpdateInstaller {
         return plan
     }
 
-    static func launch(_ plan: InstallPlan, receipt: Bool) throws -> Process {
+    static func launch(_ plan: InstallPlan, receipt: Bool, supervised: Bool = false) throws -> Process {
         let p = Process()
         p.executableURL = plan.app.appendingPathComponent("Contents/MacOS/WorkBuddy2API")
         var args: [String] = plan.restartService ? [] : ["--no-start"]
         if receipt { args += ["--update-session", plan.file.path] }
         else { args += ["--update-rollback", plan.file.path] }
+        if supervised { args.append("--update-child") }
         p.arguments = args
         p.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         p.standardInput = FileHandle.nullDevice
@@ -70,12 +91,76 @@ enum UpdateInstaller {
         return p
     }
 
-    static func stop(_ child: Process) {
+    // The new bundle supplies this supervisor even when the installer helper
+    // was copied from a pre-fix application. It stays alive until the GUI and
+    // its server are cleaned up, so even an old helper cannot roll back early.
+    // Keep the old trusted helper responsible for validation and file replacement.
+    static func supervise(_ path: String) -> Int32 {
+        let operation = UpdateOperation()
+        var sources: [DispatchSourceSignal] = []
+        for number in [SIGTERM, SIGINT] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
+            source.setEventHandler { operation.cancel() }
+            source.resume()
+            sources.append(source)
+        }
+        defer { sources.forEach { $0.cancel() } }
+        do {
+            let plan = try load(path)
+            let child = try launch(plan, receipt: true, supervised: true)
+            // Legacy helpers escalate after 7 seconds. Finish within that
+            // window. If the GUI has already crashed, kill its backend without
+            // a grace period so a legacy helper's 2-second stability check
+            // cannot accept a live orphan while this supervisor cleans up.
+            defer { stop(child, grace: child.isRunning ? 2 : 0, killedWait: 2) }
+            var forwarded = false
+            while child.isRunning && operation.isActive {
+                if !forwarded, let data = try? Data(contentsOf: plan.launcherReceipt),
+                   let receipt = try? JSONDecoder().decode(UpdateReceipt.self, from: data),
+                   receipt.token == plan.token, receipt.version == plan.version,
+                   receipt.pid == child.processIdentifier {
+                    let confirmed = UpdateReceipt(token: plan.token, version: plan.version,
+                                                  pid: getpid(), serverPID: receipt.serverPID)
+                    try JSONEncoder().encode(confirmed).write(to: plan.receipt, options: .atomic)
+                    forwarded = true
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            return child.isRunning ? 1 : child.terminationStatus
+        } catch {
+            fputs("更新启动监督失败：\(error.localizedDescription)\n", stderr)
+            return 1
+        }
+    }
+
+    static func writeReceipt(_ plan: InstallPlan, serverPID: Int32?) throws {
+        let receipt = UpdateReceipt(token: plan.token, version: plan.version, pid: getpid(), serverPID: serverPID)
+        let destination = CommandLine.arguments.contains("--update-child") ? plan.launcherReceipt : plan.receipt
+        try JSONEncoder().encode(receipt).write(to: destination, options: .atomic)
+    }
+
+    static func stop(_ child: Process, grace: TimeInterval = 7, killedWait: TimeInterval = 3) {
+        // The group remains addressable after its launcher has exited. Never
+        // use the helper's group or enumerate unrelated processes by name/port.
+        let group = child.processIdentifier
+        guard group > 1, group != getpgrp() else { return }
+        kill(-group, SIGTERM)
         if child.isRunning { child.terminate() }
-        let limit = Date().addingTimeInterval(7)
-        while child.isRunning && Date() < limit { Thread.sleep(forTimeInterval: 0.1) }
+        let limit = Date().addingTimeInterval(grace)
+        while (child.isRunning || kill(-group, 0) == 0) && Date() < limit {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        // Include a server that ignored SIGTERM or outlived a crashed launcher.
+        kill(-group, SIGKILL)
         if child.isRunning { kill(child.processIdentifier, SIGKILL) }
         child.waitUntilExit()
+        // Give orphaned descendants time to exit and release their sockets
+        // before the restored application attempts to bind the same port.
+        let killedDeadline = Date().addingTimeInterval(killedWait)
+        while kill(-group, 0) == 0 && Date() < killedDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 
     // The lock file stays in place; unlinking a live flock file would allow a

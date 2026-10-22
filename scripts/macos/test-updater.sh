@@ -41,3 +41,4 @@ xcrun swiftc -swift-version 5 -framework AppKit cmd/macosapp/UpdateCore.swift \
 "$test_dir/controller-tests"
 
 python3 tests/macos/test-manifest.py
+python3 tests/macos/test-process-cleanup.py
