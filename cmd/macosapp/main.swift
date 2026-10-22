@@ -303,9 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   plan.version == Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String else {
                 throw UpdateFailure("新版启动确认的路径或版本不匹配。")
             }
-            let receipt = UpdateReceipt(token: plan.token, version: plan.version, pid: getpid(),
-                                        serverPID: process?.processIdentifier)
-            try JSONEncoder().encode(receipt).write(to: plan.receipt, options: .atomic)
+            try UpdateInstaller.writeReceipt(plan, serverPID: process?.processIdentifier)
             updateReceiptWritten = true
             let deadline = Date().addingTimeInterval(15)
             updateResultTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] timer in
@@ -418,6 +416,12 @@ if let index = CommandLine.arguments.firstIndex(of: "--apply-update") {
     signal(SIGTERM, SIG_DFL)
     signal(SIGINT, SIG_DFL)
     exit(UpdateInstaller.apply(CommandLine.arguments[index + 1]))
+}
+
+if let index = CommandLine.arguments.firstIndex(of: "--update-session"),
+   !CommandLine.arguments.contains("--update-child") {
+    guard CommandLine.arguments.indices.contains(index + 1) else { exit(2) }
+    exit(UpdateInstaller.supervise(CommandLine.arguments[index + 1]))
 }
 
 let app = NSApplication.shared

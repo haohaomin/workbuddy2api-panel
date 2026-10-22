@@ -13,7 +13,8 @@ on:
 permissions:
   contents: write
 
-# Serialize releases, including manual tags, without cancelling an active upload.
+# Every publisher (push, tag, manual and retry) shares this lock through Latest
+# reconciliation. Additional release workflows must use the same group.
 concurrency:
   group: binaries-release
   cancel-in-progress: false
@@ -193,6 +194,8 @@ jobs:
           state="$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
           if [ "$state" = false ]; then
             echo "v${VERSION} is already published; leaving its assets unchanged."
+            # Resume a failed post-publication reconciliation without re-uploading.
+            python3 scripts/release-latest.py "$VERSION"
             exit 0
           fi
           if [ "$state" != true ]; then
@@ -201,7 +204,6 @@ jobs:
           fi
           # A failed upload can be retried against the existing draft.
           gh release upload "v${VERSION}" "${files[@]}" release-assets/macos-update.json --clobber
-          # Make the release discoverable only after every asset and manifest is uploaded.
-          # Retrying an older draft must not move Latest behind a newer release.
-          latest="$(python3 scripts/release-latest.py "$VERSION")"
-          gh release edit "v${VERSION}" --draft=false "--latest=$latest"
+          # Publish without promotion, then reconcile and verify the highest
+          # published timestamp while still holding binaries-release.
+          python3 scripts/release-latest.py "$VERSION"
