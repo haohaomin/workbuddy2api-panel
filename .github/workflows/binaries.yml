@@ -46,6 +46,7 @@ jobs:
       - name: Test
         run: |
           python3 tests/test-release-version.py
+          python3 tests/test-release-latest.py
           go test ./...
 
       - name: Build Windows and Linux binaries
@@ -201,4 +202,6 @@ jobs:
           # A failed upload can be retried against the existing draft.
           gh release upload "v${VERSION}" "${files[@]}" release-assets/macos-update.json --clobber
           # Make the release discoverable only after every asset and manifest is uploaded.
-          gh release edit "v${VERSION}" --draft=false --latest
+          # Retrying an older draft must not move Latest behind a newer release.
+          latest="$(python3 scripts/release-latest.py "$VERSION")"
+          gh release edit "v${VERSION}" --draft=false "--latest=$latest"
