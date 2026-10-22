@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rebuild the PNG preview and all macOS icon resolutions from the vector master.
+# Rebuild all macOS icon resolutions from the WorkBuddy PNG used in README.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 assets="scripts/macos/assets"
@@ -8,7 +8,6 @@ temp_dir="$(mktemp -d)"
 trap 'rm -rf "$temp_dir"' EXIT
 iconset="$temp_dir/AppIcon.iconset"
 mkdir -p "$iconset"
-xcrun swift scripts/macos/render-icon.swift "$assets/AppIcon.png"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" "$assets/AppIcon.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))
