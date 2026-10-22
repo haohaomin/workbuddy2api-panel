@@ -219,6 +219,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let child = Process()
             child.executableURL = Bundle.main.resourceURL!.appendingPathComponent("wb2api")
             child.arguments = ["-config", root.appendingPathComponent("config.json").path]
+            if CommandLine.arguments.contains("--update-session") {
+                // Join the helper-owned launcher's process group before exec.
+                // A receipt alone cannot track a crash just after server spawn.
+                child.arguments = ["--run-update-server", child.executableURL!.path] + child.arguments!
+                child.executableURL = Bundle.main.executableURL!
+            }
             child.currentDirectoryURL = root
             child.standardOutput = log
             child.standardError = log
@@ -401,6 +407,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         return true
     }
+}
+
+if CommandLine.arguments.dropFirst().first == "--run-update-server" {
+    UpdateInstaller.runUpdateServer(Array(CommandLine.arguments.dropFirst(2)))
 }
 
 if let index = CommandLine.arguments.firstIndex(of: "--apply-update") {

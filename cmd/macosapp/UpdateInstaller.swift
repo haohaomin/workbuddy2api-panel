@@ -47,6 +47,25 @@ struct UpdateReceipt: Codable {
 // The helper is a copy of the currently trusted launcher, outside the bundle
 // being replaced. It runs without AppKit and never writes the user's data tree.
 enum UpdateInstaller {
+    // Foundation launches each Process in its own process group on macOS.
+    // Before exec, put the update's server back in the launcher's group so the
+    // helper can clean up both even if the launcher crashes before its receipt.
+    static func runUpdateServer(_ arguments: [String]) -> Never {
+        let parent = getppid()
+        guard !arguments.isEmpty, parent > 1, getpgid(parent) == parent,
+              setpgid(0, parent) == 0 else {
+            fputs("Cannot join the update launcher's process group.\n", stderr)
+            exit(2)
+        }
+        let strings = arguments.map { strdup($0) }
+        var argv = strings + [nil]
+        argv.withUnsafeMutableBufferPointer { buffer in
+            _ = execv(arguments[0], buffer.baseAddress!)
+        }
+        fputs("Cannot execute the update's server.\n", stderr)
+        exit(2)
+    }
+
     static func load(_ path: String) throws -> InstallPlan {
         let plan = try JSONDecoder().decode(InstallPlan.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
         guard plan.file.path == path else { throw UpdateFailure("更新计划路径无效。") }
@@ -71,11 +90,26 @@ enum UpdateInstaller {
     }
 
     static func stop(_ child: Process) {
+        // The group remains addressable after its launcher has exited. Never
+        // use the helper's group or enumerate unrelated processes by name/port.
+        let group = child.processIdentifier
+        guard group > 1, group != getpgrp() else { return }
+        kill(-group, SIGTERM)
         if child.isRunning { child.terminate() }
         let limit = Date().addingTimeInterval(7)
-        while child.isRunning && Date() < limit { Thread.sleep(forTimeInterval: 0.1) }
+        while (child.isRunning || kill(-group, 0) == 0) && Date() < limit {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        // Include a server that ignored SIGTERM or outlived a crashed launcher.
+        kill(-group, SIGKILL)
         if child.isRunning { kill(child.processIdentifier, SIGKILL) }
         child.waitUntilExit()
+        // Give orphaned descendants time to exit and release their sockets
+        // before the restored application attempts to bind the same port.
+        let killedDeadline = Date().addingTimeInterval(3)
+        while kill(-group, 0) == 0 && Date() < killedDeadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
     }
 
     // The lock file stays in place; unlinking a live flock file would allow a
