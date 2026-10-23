@@ -105,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         footnote.textColor = .secondaryLabelColor
         let separator = NSBox()
         separator.boxType = .separator
-        let updateActions = NSStackView(views: [updater.button, updater.cancelButton, updater.releaseButton, updater.logButton])
+        let updateActions = NSStackView(views: [updater.button, updater.cancelButton, updater.releaseButton, updater.logButton, updater.backupButton])
         updateActions.spacing = 10
         let stack = NSStackView(views: [title, subtitle, status, detail, address, controls, utilities,
                                         separator, updater.text, updater.progress, updateActions, footnote])

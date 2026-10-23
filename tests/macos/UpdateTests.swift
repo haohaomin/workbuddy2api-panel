@@ -103,6 +103,35 @@ struct UpdateTests {
         try Data("bad".utf8).write(to: invalid.staged.appendingPathComponent("Contents/Resources/wb2api"))
         try rejects("corrupt staged executable") { try UpdateInstaller.replace(invalid, verifyLaunch: {}, restoreLaunch: {}) }
         try expect(fm.fileExists(atPath: invalid.app.appendingPathComponent("old-marker").path), "invalid package leaves original untouched")
-        print("PASS: \(checks) updater policy, archive integrity, installation and rollback checks")
+        // Cleanup must never remove active/incomplete installs or follow links.
+        try JSONEncoder().encode(success).write(to: success.file)
+        try expect(try UpdateInstaller.clearBackups(for: success.app) == 0,
+                   "unfinished update backup retained")
+        try Data("completed".utf8).write(to: success.directory.appendingPathComponent("result.txt"))
+        let cleanupLock = try UpdateInstaller.installationLock(for: success.app)
+        try rejects("cleanup while installer holds lock") { _ = try UpdateInstaller.clearBackups(for: success.app) }
+        flock(cleanupLock, LOCK_UN); close(cleanupLock)
+        try expect(fm.fileExists(atPath: success.backup.path), "locked backup untouched")
+        let foreignPlan = InstallPlan(target: success.app.deletingLastPathComponent().appendingPathComponent("Other/WorkBuddy2API.app").path,
+                                      workspace: success.workspace, version: success.version,
+                                      oldPID: success.oldPID, restartService: false, token: success.token)
+        try JSONEncoder().encode(foreignPlan).write(to: success.file)
+        try expect(try UpdateInstaller.clearBackups(for: success.app) == 0, "foreign installation ignored")
+        try JSONEncoder().encode(success).write(to: success.file)
+        let savedBackup = success.directory.appendingPathComponent("saved-backup")
+        try fm.moveItem(at: success.backup.deletingLastPathComponent(), to: savedBackup)
+        try fm.createSymbolicLink(at: success.backup.deletingLastPathComponent(), withDestinationURL: savedBackup)
+        try expect(try UpdateInstaller.clearBackups(for: success.app) == 0, "symlink backup parent ignored")
+        try expect(fm.fileExists(atPath: savedBackup.appendingPathComponent("WorkBuddy2API.app").path), "symlink destination retained")
+        try fm.removeItem(at: success.backup.deletingLastPathComponent())
+        try fm.moveItem(at: savedBackup, to: success.backup.deletingLastPathComponent())
+        let userData = success.app.deletingLastPathComponent().appendingPathComponent("config.json")
+        try Data("user data sentinel".utf8).write(to: userData)
+        try expect(try UpdateInstaller.clearBackups(for: success.app) == 1, "completed backup removed")
+        try expect(!fm.fileExists(atPath: success.backup.path) && fm.fileExists(atPath: success.app.path), "current app preserved")
+        try expect(fm.fileExists(atPath: success.file.path), "supervisor plan retained")
+        try expect(try String(contentsOf: userData, encoding: .utf8) == "user data sentinel", "user data unchanged")
+        try expect(try UpdateInstaller.clearBackups(for: success.app) == 0, "repeat cleanup is harmless")
+        print("PASS: \(checks) updater policy, archive integrity, installation, rollback and cleanup checks")
     }
 }

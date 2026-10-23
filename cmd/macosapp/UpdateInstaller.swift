@@ -48,6 +48,44 @@ struct UpdateReceipt: Codable {
 // The helper is a copy of the currently trusted launcher, outside the bundle
 // being replaced. It runs without AppKit and never writes the user's data tree.
 enum UpdateInstaller {
+    // Only remove backups belonging to successful updates of this installation.
+    // Keep plans/receipts: a running update supervisor may still use them.
+    static func clearBackups(for app: URL) throws -> Int {
+        let fm = FileManager.default
+        let app = app.standardizedFileURL
+        guard app.lastPathComponent == "WorkBuddy2API.app",
+              app.resolvingSymlinksInPath().path == app.path else {
+            throw UpdateFailure("请从正常安装目录中的应用清理备份。")
+        }
+        let lock = try installationLock(for: app)
+        defer { flock(lock, LOCK_UN); close(lock) }
+        func isReal(_ url: URL, directory: Bool) -> Bool {
+            guard let values = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey]),
+                  values.isSymbolicLink != true else { return false }
+            return directory ? values.isDirectory == true : values.isRegularFile == true
+        }
+        var removed = 0
+        let parent = app.deletingLastPathComponent()
+        for name in try fm.contentsOfDirectory(atPath: parent.path) {
+            let directory = parent.appendingPathComponent(name, isDirectory: true)
+            guard directory.lastPathComponent.hasPrefix(".WorkBuddy2API-update-"),
+                  isReal(directory, directory: true),
+                  isReal(directory.appendingPathComponent("plan.json"), directory: false),
+                  isReal(directory.appendingPathComponent("result.txt"), directory: false),
+                  let plan = try? load(directory.appendingPathComponent("plan.json").path),
+                  plan.app.path == app.path,
+                  isReal(plan.backup.deletingLastPathComponent(), directory: true),
+                  isReal(plan.backup, directory: true) else { continue }
+            do {
+                try fm.removeItem(at: plan.backup)
+                removed += 1
+            } catch {
+                throw UpdateFailure("已清除 \(removed) 份备份，其余清理失败：\(error.localizedDescription)")
+            }
+        }
+        return removed
+    }
+
     // Foundation launches each Process in its own process group on macOS.
     // Before exec, put the update's server back in the launcher's group so the
     // helper can clean up both even if the launcher crashes before its receipt.

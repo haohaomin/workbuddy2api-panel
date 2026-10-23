@@ -37,7 +37,7 @@ xcrun swiftc -swift-version 5 cmd/macosapp/UpdateCore.swift cmd/macosapp/UpdateI
 "$test_dir/tests" "$test_dir/WorkBuddy2API.app" "$test_dir/update.zip"
 
 xcrun swiftc -swift-version 5 -framework AppKit cmd/macosapp/UpdateCore.swift \
-  cmd/macosapp/UpdateController.swift tests/macos/ControllerTests.swift -o "$test_dir/controller-tests"
+  cmd/macosapp/UpdateInstaller.swift cmd/macosapp/UpdateController.swift tests/macos/ControllerTests.swift -o "$test_dir/controller-tests"
 "$test_dir/controller-tests"
 
 python3 tests/macos/test-manifest.py

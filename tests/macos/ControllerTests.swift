@@ -60,6 +60,7 @@ struct ControllerTests {
         let controller = UpdateController(currentVersion: "dev", configuration: config)
         controller.check(manual: true)
         controller.check(manual: true)
+        require(!controller.backupButton.isEnabled, "backup cleanup disabled during update work")
         pump(0.03)
         require(UpdateStub.requests == 1, "duplicate checks must be coalesced")
         controller.cancelCurrent()
@@ -90,12 +91,18 @@ struct ControllerTests {
         pump()
         require(controller.text.stringValue == rollback, "automatic check must not overwrite rollback notice")
         controller.showInstalled(UpdateStub.version)
+        require(controller.backupButton.isEnabled, "backup cleanup enabled after update work")
+        let actions = NSStackView(views: [controller.button, controller.cancelButton,
+                                         controller.releaseButton, controller.logButton, controller.backupButton])
+        actions.spacing = 10
+        controller.cancelButton.isHidden = false
+        require(actions.fittingSize.width <= 524, "all update actions must fit the console width")
         require(controller.text.stringValue.contains("已成功更新"), "successful handoff must be visible")
         controller.cancel()
         let requests = UpdateStub.requests
         controller.check(manual: true)
         pump()
         require(UpdateStub.requests == requests, "closed app cannot schedule new update work")
-        print("PASS: 9 controller cancellation, concurrency and status checks")
+        print("PASS: 12 controller cancellation, concurrency, cleanup-button and layout checks")
     }
 }

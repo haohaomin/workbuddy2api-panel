@@ -29,6 +29,13 @@ final class UpdateController: NSObject {
         return b
     }()
     let progress = NSProgressIndicator()
+    lazy var backupButton: NSButton = {
+        let b = NSButton(title: "清除备份", target: self, action: #selector(confirmClearBackups))
+        b.bezelStyle = .rounded
+        b.controlSize = .large
+        b.toolTip = "删除成功更新后保留的旧应用，不影响账号、配置或当前服务。"
+        return b
+    }()
     var onInstall: ((URL, AvailableUpdate) -> Void)?
     private(set) var busy = false
     private var available: AvailableUpdate?
@@ -42,6 +49,8 @@ final class UpdateController: NSObject {
     private let session: URLSession
     private var closed = false
     private var preserveNotice = false
+    private var clearingBackups = false
+    private var backupsCleared = false
 
     init(currentVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev",
          configuration: URLSessionConfiguration = .ephemeral) {
@@ -104,9 +113,46 @@ final class UpdateController: NSObject {
     private func refreshButton() {
         button.title = available == nil ? "检查更新" : "更新并重启"
         button.isEnabled = !busy && !closed
+        backupButton.isEnabled = !busy && !closed
         cancelButton.isHidden = !busy || operation == nil
         progress.isHidden = !busy
         if !busy { progress.stopAnimation(nil) }
+    }
+    @objc private func confirmClearBackups() {
+        guard !busy, !closed, let window = backupButton.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "清除旧版应用备份？"
+        alert.informativeText = "仅删除成功更新留下的旧应用。账号、配置和当前服务不受影响。删除后无法再使用这些备份手动恢复旧版。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "清除备份")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertSecondButtonReturn else { return }
+            self?.clearBackups()
+        }
+    }
+    private func clearBackups() {
+        guard !busy, !closed else { return }
+        busy = true
+        clearingBackups = true
+        preserveNotice = true
+        refreshButton()
+        show("正在清理旧版应用备份…")
+        let app = Bundle.main.bundleURL
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try UpdateInstaller.clearBackups(for: app) }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.clearingBackups = false
+                self.busy = false
+                guard !self.closed else { return }
+                self.refreshButton()
+                do {
+                    let count = try result.get()
+                    if count > 0 { self.backupsCleared = true }
+                    self.show(count == 0 ? "没有可清除的旧版备份。" : "已清除 \(count) 份旧版备份，账号和配置保持不变。")
+                } catch { self.show(error.localizedDescription) }
+            }
+        }
     }
     @objc private func clicked() {
         if let update = available { install(update) } else { check(manual: true) }
@@ -284,12 +330,13 @@ final class UpdateController: NSObject {
     }
 
     func showInstalled(_ version: String) {
+        guard !clearingBackups else { return }
         preserveNotice = true
         operation?.cancel()
         busy = false
         operation = nil
         refreshButton()
-        show("已成功更新至 v\(version)，旧版备份已保留。")
+        show("已成功更新至 v\(version)，" + (backupsCleared ? "旧版备份已清除。" : "旧版备份已保留，可点击“清除备份”释放空间。"))
     }
 
     func installationFailed(_ error: Error) { failed(error) }
