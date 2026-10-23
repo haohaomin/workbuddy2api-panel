@@ -20,9 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -1787,7 +1787,14 @@ type v3ModelPromotion struct {
 	Enabled  bool     `json:"enabled"`
 	Priority int      `json:"priority"`
 	ModelIDs []string `json:"modelIds"`
-	Badge    *struct {
+	// ID / Name / Tags：优惠数组里还夹着**纯模型定义**（无 kind/discount，只有
+	// id+name+tags）。实测 2026-10-22：global 的 hy-image-3.5 只出现在这里、
+	// data.models 里没有——只按 models 解析会得出「国际版没有出图模型」的假
+	// 结论（实际可调：200 + usage{output_image_tokens:15000, credit:0.27}）。
+	ID   string   `json:"id"`
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
+	Badge *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 	Discount *struct {
@@ -1884,11 +1891,16 @@ type v3ModelTier struct {
 	} `json:"badge"`
 }
 
+// proOnlyFallback 上游 modelTiers 漏收录、但实测被拒的模型。2026-10-23 实测：
+// primary-model 三个 global 号全回 11158 not allowed for user type [personal]，
+// 同档 gpt-5.4/6.x 都在表内，只有它漏标。上游补进表后本清单即可删。
+var proOnlyFallback = []string{"primary-model"}
+
 // applyModelTiers 给受限模型挂官方标识文案（同模型多条命中取 priority 最高）。
 // 只标注不过滤：一次 /v1/models 是全池共享的，而层级是账号级属性，在列表接口上
 // 没有「当前账号」，硬过滤会按池里最差的号降级掉所有人的选择。
 func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
-	if len(tiers) == 0 || len(out) == 0 {
+	if len(out) == 0 {
 		return
 	}
 	best := map[string]int{}
@@ -1906,6 +1918,13 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 			}
 			best[id] = t.Priority
 			mi.Tier = t.Badge.Label
+			out[id] = mi
+		}
+	}
+	// 上游表漏标的兜底：已有官方文案的不覆盖（上游才是权威）。
+	for _, id := range proOnlyFallback {
+		if mi, ok := out[id]; ok && mi.Tier == "" {
+			mi.Tier = "Pro Only"
 			out[id] = mi
 		}
 	}
@@ -2199,6 +2218,22 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		mi.Credits = ""
 		mi.Tags = nil
 		out[id] = mi
+	}
+	// 优惠数组里内嵌的模型定义（只有 id/name/tags，没有 kind/discount）：上游把
+	// 部分出图模型只放这里（实测 2026-10-22 global 的 hy-image-3.5），data.models
+	// 里没有。补进目录后，stashGenerationModels 会把它按 image 留存并单列，
+	// nonChatModel 也会照旧把它挡在对话列表之外——不必另写一套过滤。
+	// 只补媒体生成类（tags 命中 text-to-image / image-to-image / video）：其它
+	// 形态没有实测样本，不猜。
+	for _, pr := range env.Data.ModelPromotions {
+		id := strings.TrimSpace(pr.ID)
+		if id == "" || generationKind(pr.Tags) == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		out[id] = ModelInfo{ID: id, Name: pr.Name, Tags: pr.Tags}
 	}
 	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/

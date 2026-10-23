@@ -656,11 +656,14 @@ function outCell(m, pr) {
    WorkBuddy 客户端显示的正是生效价。有折扣：生效价大字 + 标签 + 划线牌价，
    悬停带时段说明；无 factor 只有标签（错峰类）：牌价 + 标签。
 
-   出图模型单独一套口径（两域计费模型不同，见 /panel/api/models 的 credit_source）：
-   - CN hunyuan-image-alpha：目录牌价 x5.00，但实扣每张固定 5.71（牌价低 14%），
-     所以两个数都显示，牌价不被实测覆盖、实测也不被牌价盖住；
-   - global gpt-image-2.5-sunburst：目录不报倍率，按输出图像 token 计费
-     （credit = tokens/7300），单张价随 quality/size 变，故显示实扣 + 档位。 */
+   出图模型单独一套口径（2026-10-22 复测，见 /panel/api/models 的 credit_source）：
+   目录对出图模型已不报 credits（CN 混元条目只剩 id/name/tags），这一列基本只剩
+   「实测」一种来源：
+   - CN hunyuan-image-alpha：实扣每张固定 5.71，回执 output_image_coefficient=1，
+     与 size/quality/n 全无关（1024/768/512 + n=2 恒等）；
+   - global hy-image-3.5：实扣每张固定 0.27，回执恒 15000 output_image_tokens，
+     但 low/medium/high 与 512/1024/1536 六档实测同价——token 数不代表单价，
+     按 token 反推价格是错的，只能如实显示回执 credit。 */
 function rateCell(m) {
   const tip = m.promo_note ? ' title="' + esc(m.promo_note) + '"' : '';
   if (m.promo_factor != null && m.promo_credits) {
@@ -707,7 +710,8 @@ function imageRateCell(m) {
     tip = '上游目录不报倍率；此值为上游出图回执 usage.credit' +
       (tier ? '（' + tier + '）' : '') +
       (last && last.output_image_tokens ? '，输出图像 ' + last.output_image_tokens + ' token' : '') +
-      '。该模型按输出图像 token 计费，画质/尺寸不同价不同。';
+      (last && last.output_image_coefficient ? '，回执倍率 ' + last.output_image_coefficient + 'x' : '') +
+      '。实测该模型按张固定计价，画质/尺寸不影响价格。';
   }
   const shown = Number(used).toFixed(2);
   const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
@@ -1016,7 +1020,7 @@ function renderErrorSummary(d) {
     '<td class="num">' + r.count + '</td>' +
     '<td>' + esc(r.last || '—') + '</td>' +
     '<td>' + esc(r.until || '—') + '</td>' +
-    '<td class="sample" title="' + esc(r.sample || '') + '">' + esc(r.sample || '') + '</td></tr>'
+    '<td class="sample" title="' + esc(r.sample_full || r.sample || '') + '">' + esc(r.sample || '') + '</td></tr>'
   ).join('') : '<tr><td colspan="8" style="color:var(--ink-3)">窗口内没有 WARN/ERR</td></tr>';
   $('errNote').textContent = d
     ? '扫描 ' + (d.scanned || 0) + ' 行 · ' + rows.length + ' 类 · 截至 ' + (d.updated_at || '—')
@@ -1672,6 +1676,10 @@ const AUTO_TASKS = {
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
   'WorkBuddy_Valorant': '真实「无畏契约拼豆专家」召唤+使用链（真实对话 requestId，截止 11-15）',
+  'expert_use_maidehao': '「中国电商运营专家」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_douyinyin': '「抖音策略师」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_shangjia_xuanchuan': '「商家宣传页与海报设计师」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
+  'expert_use_bowangwang': '「直播电商教练」召唤+使用链（专家页搜索口径，截止 11-20，+50 分）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
   'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
   'Sequential_Tasks_2': '小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）',
