@@ -9,6 +9,11 @@ on:
       - "AutoBot.yml"
       - "scripts/autobot.py"
   workflow_dispatch:
+  # Fork synchronization can update main without starting a push workflow.
+  # This lightweight poller catches such commits and the normal push trigger
+  # remains the fast path.
+  schedule:
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: write
@@ -24,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      needs_publish: ${{ steps.release-state.outputs.needs_publish }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,9 +38,23 @@ jobs:
         id: version
         # GITHUB_TOKEN tag pushes do not trigger another workflow; publish below.
         run: python3 scripts/release-version.py
+      - name: Check whether this commit needs a package
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          state="$(gh release view "v${{ steps.version.outputs.version }}" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
+          if [ "$state" = false ]; then
+            echo "needs_publish=false" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.version.outputs.version }} is already published; scheduled check will skip builds."
+          else
+            echo "needs_publish=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: version
+    if: needs.version.outputs.needs_publish == 'true'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -113,6 +133,7 @@ jobs:
 
   build-macos:
     needs: version
+    if: needs.version.outputs.needs_publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -171,7 +192,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.version.outputs.needs_publish == 'true'
     needs: [version, build, build-macos]
     runs-on: ubuntu-latest
     env:
