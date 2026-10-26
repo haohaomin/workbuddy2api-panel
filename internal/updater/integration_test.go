@@ -91,7 +91,7 @@ func TestRestartFixtureProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if verifying {
-		time.Sleep(3 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {

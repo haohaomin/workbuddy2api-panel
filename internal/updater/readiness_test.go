@@ -52,7 +52,7 @@ func TestReadinessFixture(t *testing.T) {
 			}
 			select {}
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -93,7 +93,7 @@ func TestHelperRollsBackAfterSuccessfulSpawn(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			ext := filepath.Ext(executable)
-			target, stage, helper := filepath.Join(dir, "wb2api"+ext), filepath.Join(dir, "stage"+ext), filepath.Join(dir, "helper"+ext)
+			target, stage, helper := filepath.Join(dir, "wb2api"+ext), filepath.Join(dir, ".wb2api-stage-test"+ext), filepath.Join(dir, ".wb2api-updater-test"+ext)
 			for _, path := range []string{target, stage, helper} {
 				if err := os.WriteFile(path, original, 0700); err != nil {
 					t.Fatal(err)
