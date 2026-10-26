@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -41,7 +42,8 @@ import (
 // appVersion 面板版本，透出到 /panel/api/overview。
 // 本地构建保持 dev。发布构建由 CI 用 -X 注入上海时间（2026.9.26.711），不跟上游 1.x。
 var appVersion = "dev"
-var appRepository = "haohaomin/workbuddy2api-panel"
+
+const appRepository = updater.Repository
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -532,7 +534,15 @@ func main() {
 	}()
 
 	log.Print(listenBanner(cfg.Listen, loadedFrom, cfg.APIKey))
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		log.Fatalf("http listen: %v", err)
+	}
+	if err := updater.ReportReady(); err != nil {
+		_ = listener.Close()
+		log.Fatalf("update readiness: %v", err)
+	}
+	if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 	if ctx.Err() != nil {

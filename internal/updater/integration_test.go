@@ -50,16 +50,19 @@ func TestInstallFixtureProcess(t *testing.T) {
 	m.SetRestart(func() {})
 	m.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body := archive
+		if strings.HasSuffix(r.URL.Path, "/update.json") {
+			return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+		}
 		if r.URL.Host == "api.github.com" {
-			body, err = json.Marshal([]release{{
+			body, err = json.Marshal(release{
 				TagName: "v2026.10.23.1859",
 				Assets: []releaseAsset{{
 					Name:               fmt.Sprintf("wb2api-panel-2026.10.23.1859-%s-%s.zip", runtime.GOOS, runtime.GOARCH),
-					BrowserDownloadURL: "https://github.com/example/project/releases/download/test/file.zip",
+					BrowserDownloadURL: fmt.Sprintf("https://github.com/example/project/releases/download/v2026.10.23.1859/wb2api-panel-2026.10.23.1859-%s-%s.zip", runtime.GOOS, runtime.GOARCH),
 					Size:               int64(len(archive)),
 					Digest:             "sha256:" + hex.EncodeToString(sum[:]),
 				}},
-			}})
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -82,6 +85,13 @@ func TestRestartFixtureProcess(t *testing.T) {
 	dir := os.Getenv("WB2API_UPDATE_FIXTURE")
 	if dir == "" {
 		t.Skip("subprocess fixture")
+	}
+	verifying := os.Getenv(readyPathEnv) != ""
+	if err := ReportReady(); err != nil {
+		t.Fatal(err)
+	}
+	if verifying {
+		time.Sleep(3 * time.Second)
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -108,7 +118,11 @@ func TestInstallReplacesRestartsAndRecovers(t *testing.T) {
 		t.Run(fmt.Sprintf("broken=%v", broken), func(t *testing.T) {
 			dir := t.TempDir()
 			t.Setenv("WB2API_UPDATE_FIXTURE", dir)
-			target := filepath.Join(dir, "wb2api"+filepath.Ext(executable))
+			name := "wb2api"
+			if runtime.GOOS == "windows" {
+				name += ".exe"
+			}
+			target := filepath.Join(dir, name)
 			if err := os.WriteFile(target, original, 0700); err != nil {
 				t.Fatal(err)
 			}

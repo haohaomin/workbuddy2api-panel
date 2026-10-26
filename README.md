@@ -240,7 +240,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/misakano7545/workbuddy2api-panel:latest
+  ghcr.io/haohaomin/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -255,7 +255,7 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/misakano7545/workbuddy2api-panel.git
+git clone https://github.com/haohaomin/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
@@ -307,7 +307,7 @@ exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到�
 
 **一键更新**：控制窗口显示当前版本，点击「检查更新」，发现新版后点击「更新并重启」。启动、重新聚焦窗口（距上次检查超过一小时）及每六小时会自动检查；自动检查不下载、不安装，网络失败不阻塞服务。下载期间显示进度且可取消；取消后迟到的网络响应不会继续安装。服务在下载期间继续运行，校验通过后才停止服务、替换应用并重新启动；更新前已停止服务的，更新后也保持停止。
 
-更新源固定为本 fork `haohaomin/workbuddy2api-panel` 的 `releases/latest/download/macos-update.json` 清单，避免正常检查占用匿名 API 配额。旧 Release 尚无清单时回退 GitHub Latest Release API；限流会明确提示稍后重试。客户端只接受匹配芯片架构的 `*-darwin-<arch>-update.zip`，使用清单（或旧版 API）返回的 SHA-256 摘要检查下载完整性，并校验压缩包路径、应用标识、版本、架构及 macOS 代码签名完整性。当前采用 ad-hoc 代码签名，**不具备独立发布者公钥签名或 Apple 公证**；发布来源的信任依赖 GitHub HTTPS 和该仓库权限。客户端不会移除系统隔离属性或绕过 Gatekeeper。
+更新源固定为本 fork `haohaomin/workbuddy2api-panel` 的 `releases/latest/download/update.json` 清单，避免正常检查占用匿名 API 配额；同时继续提供 `macos-update.json` 兼容旧客户端。旧 Release 尚无清单时回退同一仓库的 GitHub Latest Release API；限流会明确提示稍后重试。客户端只接受匹配芯片架构的 `*-darwin-<arch>-update.zip`，使用清单（或旧版 API）返回的 SHA-256 摘要检查下载完整性，并校验压缩包路径、应用标识、版本、架构及 macOS 代码签名完整性。当前采用 ad-hoc 代码签名，**不具备独立发布者公钥签名或 Apple 公证**；发布来源的信任依赖 GitHub HTTPS 和该仓库权限。客户端不会移除系统隔离属性或绕过 Gatekeeper。
 
 替换助手等待旧应用退出，通过 macOS 原子交换切换应用，避免安装路径短暂缺失，并通过安装锁阻止两个更新助手并发替换。旧版保存在安装目录的 `.WorkBuddy2API-update-<UUID>/backup/WorkBuddy2API.app`，再启动新版并等待就绪确认。新版在更新启动期间自带独立监督进程，窗口崩溃或启动超时会先清理本次启动的后台服务，再允许回滚；从尚未包含此修复的旧版升级也适用。启动失败时恢复旧版；旧版备份不会在确认前删除，成功后也保留供手动恢复。可在控制台更新区点击「清除备份」，确认后删除当前安装成功更新留下的旧应用；不影响账号、配置和当前服务，未完成更新的备份不会清除。更新成功或回滚结果会保留显示；窗口提供「发布说明」「更新日志」入口。旧进程退出后如再校验失败，也会重新打开原应用。安装日志位于数据目录的 `data/updater.log`。更新器只替换 `.app`，不迁移或删除账号、配置和运行数据。安装目录不可写时会报告错误并保留当前安装，请先将应用放入可写的「应用程序」目录。
 
@@ -804,7 +804,11 @@ http://127.0.0.1:7863/panel/
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
 
-面板左上角会显示当前版本；启动后会定期查询 GitHub Release，发现更新时显示提醒。设置页可手动检查、打开 Release 或一键更新。更新前会校验 GitHub SHA-256 摘要并在替换失败时恢复旧程序；Docker、systemd / Windows 服务等托管环境只提示手动更新，避免覆盖由宿主机或镜像管理的程序文件。
+面板左上角会显示当前版本；启动后会定期检查发布信息，发现更新时显示提醒。桌面端和网页优先读取同一份 `update.json` 发布清单，旧版本没有清单时回退到 GitHub Latest；仍为已安装的旧版 Mac App 提供 `macos-update.json`。更新包按固定仓库、版本、平台和 SHA-256 校验。
+
+Linux / Windows 独立程序支持立即更新和每日定时安装：新版本必须在 30 秒内完成配置加载、绑定 HTTP 端口并报告就绪，再持续存活 2 秒，才清除旧程序备份。启动失败、就绪超时或验证期间退出时，停止新进程后恢复并重新启动旧程序；若无法确认新进程退出，会保留 `.old` 备份供人工恢复。此检查不保证上游 API 可用，也不回滚配置或数据迁移。
+
+macOS App 请在 WorkBuddy2API 桌面窗口使用“检查更新 / 更新并重启”，仍采用完整 App 替换和桌面端回滚；暂不支持定时安装。macOS 独立程序、Docker、systemd / Windows 服务等托管环境及开发版会显示对应更新说明，并禁用不生效的定时安装设置。已有配置中的开关保留，但不在不支持的部署中执行自动安装。
 
 顶部「刷新」按钮 = 向上游全量查询真实余额并回写（5 秒自动轮询只读内存，不打上游）。
 

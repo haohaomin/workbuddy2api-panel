@@ -224,7 +224,7 @@ jobs:
               --generate-notes --draft --verify-tag
           fi
           # A failed upload can be retried against the existing draft.
-          gh release upload "v${VERSION}" "${files[@]}" release-assets/macos-update.json --clobber
+          gh release upload "v${VERSION}" "${files[@]}" release-assets/macos-update.json release-assets/update.json --clobber
           # Publish without promotion, then reconcile and verify the highest
           # published timestamp while still holding binaries-release.
           python3 scripts/release-latest.py "$VERSION"

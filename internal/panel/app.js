@@ -608,6 +608,7 @@ function renderUpdateStatus(update) {
   $('navUpdate').hidden = !update.update_available;
   $('navUpdate').textContent = '有更新';
   $('navUpdate').title = update.update_available ? '发现 v' + update.latest_version + '，点击查看更新操作' : '';
+  renderUpdateCapabilities();
   const note = $('updateNote');
   if (update.installing) {
     note.textContent = '正在准备更新…';
@@ -624,6 +625,16 @@ function renderUpdateStatus(update) {
   $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
   $('btnUpdateRelease').hidden = !update.update_available || !!update.can_install || !update.release_url;
   $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+}
+
+function renderUpdateCapabilities() {
+  const supported = !!updateData?.can_install;
+  $('updateInstallHint').textContent = updateData?.install_hint || '当前部署不支持网页安装，请通过原部署方式更新。';
+  for (const id of ['updateAutoEnabled', 'updateAutoTime']) {
+    const el = $(id);
+    el.disabled = !supported || !!updateData?.installing || el.dataset?.environmentManaged === 'true';
+    el.title = !supported ? '此设置在当前部署中不生效' : '';
+  }
 }
 
 async function checkForUpdates() {
@@ -1490,12 +1501,14 @@ async function loadConfig() {
       const el = f.elements[name];
       if (!el) continue;
       el.disabled = managed.includes(path.join('.'));
+      el.dataset.environmentManaged = String(el.disabled);
       el.title = el.disabled ? '此项由启动环境变量设置，请在部署配置中修改。' : '';
       const v = dig(cfgLoaded, path);
       if (el.type === 'checkbox') el.checked = !!v;
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? '' : v;
     }
+    renderUpdateCapabilities();
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgKey').disabled = !!d.api_key_env_managed;
     $('cfgKey').title = d.api_key_env_managed ? '访问密钥由启动环境变量设置，请在部署配置中修改。' : '';
@@ -1507,6 +1520,7 @@ function collectConfig() {
   for (const [name, path] of Object.entries(CFG_MAP)) {
     const el = f.elements[name];
     if (!el) continue;
+    if (name.startsWith('update_auto_') && el.disabled) continue;
     let v;
     if (el.type === 'checkbox') v = el.checked;
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }

@@ -74,6 +74,7 @@ const ctx = {
 vm.createContext(ctx);
 vm.runInContext('let updateData = null, updateBusy = false;\n' +
   src.slice(src.indexOf('function displayVersion('), src.indexOf('async function loadOverview(')), ctx);
+vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='), src.indexOf('/* Go 时长字段即时校验')), ctx);
 (async () => {
   assert.equal(ctx.displayVersion('dev'), 'dev');
   assert.equal(ctx.displayVersion('v2026.10.23.1859'), 'v2026.10.23.1859');
@@ -89,6 +90,21 @@ vm.runInContext('let updateData = null, updateBusy = false;\n' +
   fail = false;
   ctx.renderUpdateStatus({...response, last_error:'checksum mismatch'});
   assert(nodes.get('updateNote').textContent.includes('checksum mismatch'));
+  ctx.renderUpdateStatus({...response, can_install:false, install_hint:'请在桌面窗口更新'});
+  assert.equal(nodes.get('updateAutoEnabled').disabled, true);
+  assert.equal(nodes.get('updateAutoTime').disabled, true);
+  assert.equal(nodes.get('updateInstallHint').textContent, '请在桌面窗口更新');
+  ctx.$('cfgForm').elements = {
+    update_auto_enabled: Object.assign(nodes.get('updateAutoEnabled'), {type:'checkbox', checked:true}),
+    update_auto_time: Object.assign(nodes.get('updateAutoTime'), {type:'time', value:'04:00'})
+  };
+  assert.equal(JSON.stringify(ctx.collectConfig()), '{}', 'saving unrelated settings preserves unsupported update config');
+  ctx.renderUpdateStatus({...response, can_install:true});
+  assert.equal(nodes.get('updateAutoEnabled').disabled, false);
+  assert.equal(ctx.collectConfig().update.auto_enabled, true, 'supported deployment saves schedule');
+  nodes.get('updateAutoEnabled').dataset = {environmentManaged:'true'};
+  ctx.renderUpdateCapabilities();
+  assert.equal(nodes.get('updateAutoEnabled').disabled, true);
   ctx.renderUpdateStatus({...response, can_install:false});
   assert.equal(nodes.get('btnUpdateInstall').hidden, true, 'unsupported platform hides install');
   response = {status:{...response, installing:true}};

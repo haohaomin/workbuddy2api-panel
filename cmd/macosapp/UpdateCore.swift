@@ -34,8 +34,15 @@ struct AppVersion: Comparable, Equatable {
         let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 4, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
               let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]), let time = Int(parts[3]),
-              (2020...9999).contains(year), (1...12).contains(month), (1...31).contains(day),
+              (2000...9999).contains(year), (1...12).contains(month), (1...31).contains(day),
               (0...23).contains(time / 100), (0...59).contains(time % 100) else { return nil }
+        guard String(year) == parts[0], String(month) == parts[1], String(day) == parts[2],
+              String(time / 100) + String(format: "%02d", time % 100) == parts[3] else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let input = DateComponents(year: year, month: month, day: day)
+        guard let date = calendar.date(from: input),
+              calendar.dateComponents([.year, .month, .day], from: date) == input else { return nil }
         components = [year, month, day, time]
     }
     static func < (lhs: Self, rhs: Self) -> Bool { lhs.components.lexicographicallyPrecedes(rhs.components) }
@@ -65,7 +72,7 @@ struct AvailableUpdate: Equatable {
 
 enum UpdatePolicy {
     static let repository = "haohaomin/workbuddy2api-panel"
-    static let manifestURL = URL(string: "https://github.com/\(repository)/releases/latest/download/macos-update.json")!
+    static let manifestURL = URL(string: "https://github.com/\(repository)/releases/latest/download/update.json")!
     static let endpoint = URL(string: "https://api.github.com/repos/\(repository)/releases/latest")!
     static let bundleID = "com.workbuddy2api.panel"
     static let maxArchiveSize = 100 * 1024 * 1024

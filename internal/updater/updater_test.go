@@ -41,31 +41,64 @@ func TestParseVersion(t *testing.T) {
 	}
 }
 
-func TestCheckSelectsNewestTimestampedRelease(t *testing.T) {
-	body := `[
-		{"tag_name":"v1.2.3","html_url":"https://example.test/old","draft":false,"prerelease":false},
-		{"tag_name":"v2026.10.23.1859","html_url":"https://github.com/example/project/releases/tag/v2026.10.23.1859","body":"notes","draft":false,"prerelease":false},
-		{"tag_name":"v2026.10.24.0100","draft":true,"prerelease":false},
-		{"tag_name":"v2026.10.24.0200","draft":false,"prerelease":true}
-	]`
+func TestCheckUsesLatestWhenManifestMissing(t *testing.T) {
+	body := `{"tag_name":"v2026.10.23.1859","html_url":"https://github.com/another/project/releases/tag/v2026.10.23.1859","body":"notes","draft":false,"prerelease":false}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/repos/example/project/releases" {
-			t.Fatalf("unexpected request path %s", r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, "/update.json") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path != "/repos/example/project/releases/latest" {
+			t.Errorf("unexpected request path %s", r.URL.Path)
 		}
 		_, _ = w.Write([]byte(body))
 	}))
 	defer server.Close()
-
 	m := New("2026.10.22.1823", "example/project", "", Settings{})
-	m.apiBaseURL = server.URL
-	m.now = func() time.Time { return time.Date(2026, 10, 24, 12, 0, 0, 0, time.FixedZone("CST", 8*3600)) }
+	m.apiBaseURL, m.manifestBaseURL = server.URL, server.URL
 	if err := m.Check(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	got := m.Status()
-	if !got.UpdateAvailable || got.LatestVersion != "2026.10.23.1859" ||
-		got.ReleaseURL != "https://github.com/example/project/releases/tag/v2026.10.23.1859" || got.ReleaseNotes != "notes" || got.CanInstall != m.canInstallLocked() {
+	if !got.UpdateAvailable || got.LatestVersion != "2026.10.23.1859" || got.ReleaseNotes != "notes" ||
+		got.ReleaseURL != "https://github.com/example/project/releases/tag/v2026.10.23.1859" {
 		t.Fatalf("unexpected status: %+v", got)
+	}
+}
+
+func TestManifestSelectionAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		wantErr    bool
+	}{
+		{"valid", `{"schema":1,"release":{"tag_name":"v2026.10.23.1859"}}`, 200, false},
+		{"draft", `{"schema":1,"release":{"tag_name":"v2026.10.23.1859","draft":true}}`, 200, true},
+		{"prerelease", `{"schema":1,"release":{"tag_name":"v2026.10.23.1859","prerelease":true}}`, 200, true},
+		{"schema", `{"schema":2}`, 200, true},
+		{"invalid", `broken`, 200, true},
+		{"unavailable", `busy`, 503, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if !strings.HasSuffix(r.URL.Path, "/update.json") {
+					t.Error("unexpected API fallback")
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			m := New("2026.10.22.1823", "example/project", "", Settings{})
+			m.apiBaseURL, m.manifestBaseURL = server.URL, server.URL
+			if err := m.Check(context.Background()); (err != nil) != tc.wantErr {
+				t.Fatalf("check: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("calls=%d", calls)
+			}
+		})
 	}
 }
 
@@ -75,7 +108,7 @@ func TestCheckReportsReleaseAPIError(t *testing.T) {
 	}))
 	defer server.Close()
 	m := New("2026.10.22.1823", "example/project", "", Settings{})
-	m.apiBaseURL = server.URL
+	m.apiBaseURL, m.manifestBaseURL = server.URL, server.URL
 	if err := m.Check(context.Background()); err == nil {
 		t.Fatal("expected API error")
 	}
@@ -238,6 +271,7 @@ func TestInstallRejectsAlreadyPendingUpdate(t *testing.T) {
 
 func TestScheduleUsesShanghaiAndRunsOncePerDay(t *testing.T) {
 	m := New("dev", "", "", Settings{AutoEnabled: true, AutoTime: "04:00"})
+	m.status.CanInstall = true // Exercise the scheduler independent of the test host.
 	now := time.Date(2026, 10, 23, 20, 0, 15, 0, time.UTC)
 	auto, regular := m.scheduleDue(now)
 	if !auto || !regular {
@@ -284,5 +318,34 @@ func TestDownloadRejectsExternalRedirectAndWrongSize(t *testing.T) {
 	}
 	if hasSHA256Digest("sha256:" + strings.Repeat("z", 64)) {
 		t.Fatal("non-hex digest accepted")
+	}
+}
+
+func TestDeploymentCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		os, arch, version, exe string
+		container, managed     bool
+		want                   string
+	}{
+		{"darwin", "arm64", "2026.10.23.1859", "/Applications/WorkBuddy2API.app/Contents/Resources/wb2api", false, false, "macos_app"},
+		{"darwin", "amd64", "2026.10.23.1859", "/bin/wb2api", false, false, "macos_binary"},
+		{"linux", "amd64", "2026.10.23.1859", "/bin/wb2api", true, false, "container"},
+		{"linux", "amd64", "2026.10.23.1859", "/bin/wb2api", false, true, "managed"},
+		{"windows", "arm64", "2026.10.23.1859", "wb2api.exe", false, false, "standalone"},
+		{"linux", "amd64", "dev", "/bin/wb2api", false, false, "development"},
+		{"linux", "386", "2026.10.23.1859", "/bin/wb2api", false, false, "unsupported"},
+	} {
+		got, hint := deploymentInfo(tc.os, tc.arch, tc.version, tc.exe, tc.container, tc.managed)
+		if got != tc.want || hint == "" {
+			t.Fatalf("%+v: %s %s", tc, got, hint)
+		}
+	}
+	m := New("dev", "", "", Settings{AutoEnabled: true, AutoTime: "04:00"})
+	if m.Status().AutoActive {
+		t.Fatal("unsupported automatic installation reported active")
+	}
+	auto, _ := m.scheduleDue(time.Date(2026, 10, 23, 20, 0, 0, 0, time.UTC))
+	if auto {
+		t.Fatal("unsupported deployment ran automatic install schedule")
 	}
 }

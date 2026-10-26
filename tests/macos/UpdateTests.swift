@@ -25,6 +25,9 @@ struct UpdateTests {
         try expect(AppVersion("2026.10.1.001")! > AppVersion("2026.9.30.2359")!, "numeric date comparison")
         try expect(AppVersion("2026.10.20.711")! < AppVersion("2026.10.20.1041")!, "numeric time comparison")
         try expect(AppVersion("1.2.3") == nil && AppVersion("2026.13.20.711") == nil, "reject non-timestamp versions")
+        for invalid in ["2026.2.29.1200", "2026.09.26.711", "2026.9.26.0711"] {
+            try expect(AppVersion(invalid) == nil, "reject invalid or noncanonical timestamp")
+        }
         try expect(try UpdatePolicy.select(release, current: version) == nil, "same version")
         try expect(try UpdatePolicy.select(release, current: "2026.10.21.100") == nil, "no downgrade")
         try expect(try UpdatePolicy.select(release, current: "dev")?.version == version, "dev may opt into release")

@@ -24,6 +24,8 @@ import (
 )
 
 const (
+	// Repository is this fork's update source, shared by every Go build.
+	Repository     = "haohaomin/workbuddy2api-panel"
 	maxArchiveSize = 300 << 20
 	maxBinarySize  = 200 << 20
 	selfUpdateArg  = "--wb2api-self-update"
@@ -49,6 +51,9 @@ type Status struct {
 	Installing      bool   `json:"installing"`
 	AutoEnabled     bool   `json:"auto_enabled"`
 	AutoTime        string `json:"auto_time"`
+	AutoActive      bool   `json:"auto_active"`
+	Deployment      string `json:"deployment"`
+	InstallHint     string `json:"install_hint"`
 }
 
 type release struct {
@@ -75,13 +80,14 @@ type parsedVersion struct {
 
 // Manager owns update discovery and the daily schedule.
 type Manager struct {
-	version    string
-	repository string
-	executable string
-	configPath string
-	apiBaseURL string
-	client     *http.Client
-	now        func() time.Time
+	version         string
+	repository      string
+	executable      string
+	configPath      string
+	apiBaseURL      string
+	manifestBaseURL string
+	client          *http.Client
+	now             func() time.Time
 
 	mu          sync.RWMutex
 	checkMu     sync.Mutex
@@ -101,20 +107,21 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		executable = resolved
 	}
 	if repository == "" {
-		repository = "haohaomin/workbuddy2api-panel"
+		repository = Repository
 	}
 	if settings.AutoTime == "" {
 		settings.AutoTime = "04:00"
 	}
 	m := &Manager{
-		version:    strings.TrimPrefix(version, "v"),
-		repository: repository,
-		executable: executable,
-		configPath: configPath,
-		apiBaseURL: "https://api.github.com",
-		client:     &http.Client{Timeout: 30 * time.Second},
-		now:        time.Now,
-		settings:   settings,
+		version:         strings.TrimPrefix(version, "v"),
+		repository:      repository,
+		executable:      executable,
+		configPath:      configPath,
+		apiBaseURL:      "https://api.github.com",
+		manifestBaseURL: "https://github.com",
+		client:          &http.Client{Timeout: 30 * time.Second},
+		now:             time.Now,
+		settings:        settings,
 		status: Status{
 			CurrentVersion: version,
 			AutoEnabled:    settings.AutoEnabled,
@@ -122,6 +129,8 @@ func New(version, repository, configPath string, settings Settings) *Manager {
 		},
 	}
 	m.status.CanInstall = m.canInstallLocked()
+	m.status.Deployment, m.status.InstallHint = deploymentInfo(runtime.GOOS, runtime.GOARCH, m.version, m.executable, isContainer(), processSupervised())
+	m.status.AutoActive = settings.AutoEnabled && m.status.CanInstall
 	return m
 }
 
@@ -140,6 +149,7 @@ func (m *Manager) Configure(settings Settings) {
 	m.mu.Lock()
 	m.settings = settings
 	m.status.AutoEnabled = settings.AutoEnabled
+	m.status.AutoActive = settings.AutoEnabled && m.status.CanInstall
 	m.status.AutoTime = settings.AutoTime
 	m.mu.Unlock()
 }
@@ -151,7 +161,7 @@ func (m *Manager) Status() Status {
 	return m.status
 }
 
-// Check fetches timestamped, non-prerelease Releases and selects the newest one.
+// Check reads the published Latest version, using the same source as the desktop.
 func (m *Manager) Check(ctx context.Context) error {
 	m.checkMu.Lock()
 	defer m.checkMu.Unlock()
@@ -178,10 +188,7 @@ func (m *Manager) Check(ctx context.Context) error {
 		if newest == nil {
 			err = errors.New("没有找到时间版本格式的正式 Release")
 		} else {
-			releaseURL := ""
-			if releaseLink, parseErr := url.Parse(newest.HTMLURL); parseErr == nil && isTrustedGitHubURL(releaseLink, true) {
-				releaseURL = newest.HTMLURL
-			}
+			releaseURL := fmt.Sprintf("https://github.com/%s/releases/tag/v%s", m.repository, newestVersion.text)
 			m.mu.Lock()
 			m.release = newest
 			m.status.LatestVersion = newestVersion.text
@@ -206,38 +213,59 @@ func (m *Manager) Check(ctx context.Context) error {
 	return err
 }
 
+// Prefer the same published manifest as the desktop app. Only a missing
+// manifest falls back to Latest; malformed metadata must not silently downgrade.
 func (m *Manager) fetchReleases(ctx context.Context) ([]release, error) {
-	var all []release
-	for page := 1; page <= 5; page++ {
-		url := fmt.Sprintf("%s/repos/%s/releases?per_page=100&page=%d", strings.TrimRight(m.apiBaseURL, "/"), m.repository, page)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/vnd.github+json")
-		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-		req.Header.Set("User-Agent", "workbuddy2api-panel-updater")
-		resp, err := m.client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("查询 GitHub Release 失败: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			return nil, fmt.Errorf("查询 GitHub Release 失败: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		var batch []release
-		err = json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&batch)
-		resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("解析 GitHub Release 失败: %w", err)
-		}
-		all = append(all, batch...)
-		if len(batch) < 100 {
-			break
-		}
+	manifestURL := strings.TrimRight(m.manifestBaseURL, "/") + "/" + m.repository + "/releases/latest/download/update.json"
+	resp, err := m.getMetadata(ctx, manifestURL)
+	if err != nil {
+		return nil, err
 	}
-	return all, nil
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return m.fetchLatest(ctx)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("查询更新清单失败: HTTP %d", resp.StatusCode)
+	}
+	var manifest struct {
+		Schema  int     `json:"schema"`
+		Release release `json:"release"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&manifest); err != nil {
+		return nil, fmt.Errorf("解析更新清单失败: %w", err)
+	}
+	if manifest.Schema != 1 {
+		return nil, errors.New("更新清单格式不受支持")
+	}
+	return []release{manifest.Release}, nil
+}
+
+func (m *Manager) getMetadata(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "workbuddy2api-panel-updater")
+	return m.client.Do(req)
+}
+
+func (m *Manager) fetchLatest(ctx context.Context) ([]release, error) {
+	endpoint := fmt.Sprintf("%s/repos/%s/releases/latest", strings.TrimRight(m.apiBaseURL, "/"), m.repository)
+	resp, err := m.getMetadata(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("查询 GitHub Release 失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("查询 GitHub Release 失败: HTTP %d", resp.StatusCode)
+	}
+	var latest release
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&latest); err != nil {
+		return nil, err
+	}
+	return []release{latest}, nil
 }
 
 // Install downloads and stages the matching release asset. The caller should
@@ -292,8 +320,8 @@ func (m *Manager) Install(ctx context.Context) (err error) {
 		return fmt.Errorf("Release 缺少当前平台文件 %s", assetName)
 	}
 	assetURL, err := url.Parse(asset.BrowserDownloadURL)
-	if err != nil || !isTrustedGitHubURL(assetURL, true) {
-		return errors.New("Release 下载地址不是受信任的 GitHub HTTPS 地址")
+	if err != nil || !isTrustedGitHubURL(assetURL, true) || asset.BrowserDownloadURL != fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", m.repository, r.TagName, assetName) {
+		return errors.New("Release 下载地址与当前仓库、版本或平台不符")
 	}
 	if asset.Size <= 0 || asset.Size > maxArchiveSize {
 		return fmt.Errorf("Release 文件大小异常: %d", asset.Size)
@@ -476,11 +504,13 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 			_ = os.Remove(helperPath)
 		}
 	}
-	startTarget := func() error {
+	targetCommand := func() *exec.Cmd {
 		cmd := exec.Command(targetPath, originalArgs...)
 		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-		return startChild(cmd)
+		cmd.Env = withoutReadinessEnv(os.Environ())
+		return cmd
 	}
+	startTarget := func() error { return startChild(targetCommand()) }
 	restore, cleanup, err := replaceBinaryWithRollback(stagePath, targetPath)
 	if err != nil {
 		restartErr := startTarget()
@@ -489,7 +519,11 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		return true, errors.Join(fmt.Errorf("替换程序文件: %w", err), restartErr)
 	}
 	_ = os.Remove(stagePath)
-	if err := startTarget(); err != nil {
+	if safe, err := startVerified(targetCommand(), 30*time.Second, 2*time.Second); err != nil {
+		if !safe {
+			cleanupHelper()
+			return true, err
+		}
 		restoreErr := restore()
 		if restoreErr == nil {
 			restoreErr = startTarget()
@@ -721,7 +755,7 @@ func (m *Manager) scheduleDue(now time.Time) (auto, regular bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	day := now.Format("2006-01-02")
-	auto = m.settings.AutoEnabled && now.Format("15:04") == m.settings.AutoTime && m.lastAutoDay != day
+	auto = m.status.CanInstall && m.settings.AutoEnabled && now.Format("15:04") == m.settings.AutoTime && m.lastAutoDay != day
 	if auto {
 		m.lastAutoDay = day
 	}
@@ -729,11 +763,30 @@ func (m *Manager) scheduleDue(now time.Time) (auto, regular bool) {
 }
 
 func (m *Manager) canInstallLocked() bool {
-	_, versioned := parseVersion(m.version)
-	return versioned &&
-		(runtime.GOOS == "linux" || runtime.GOOS == "windows") &&
-		(runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") &&
-		m.executable != "" && !isContainer() && !processSupervised()
+	deployment, _ := deploymentInfo(runtime.GOOS, runtime.GOARCH, m.version, m.executable, isContainer(), processSupervised())
+	return deployment == "standalone"
+}
+
+func deploymentInfo(goos, arch, version, executable string, container, supervised bool) (string, string) {
+	if _, ok := parseVersion(version); !ok {
+		return "development", "开发版请从源码重新构建，或安装正式发布版本。"
+	}
+	if goos == "darwin" {
+		if strings.Contains(filepath.ToSlash(executable), ".app/Contents/Resources/") {
+			return "macos_app", "请在 WorkBuddy2API 桌面窗口点击“检查更新 / 更新并重启”；桌面版暂不支持定时安装。"
+		}
+		return "macos_binary", "macOS 独立程序请从 Release 下载替换；桌面应用请使用桌面窗口更新。"
+	}
+	if container {
+		return "container", "容器部署请拉取新镜像并重新创建容器。"
+	}
+	if supervised {
+		return "managed", "此服务由服务管理器托管，请通过原部署方式更新并重启。"
+	}
+	if (goos == "linux" || goos == "windows") && (arch == "amd64" || arch == "arm64") && executable != "" {
+		return "standalone", "支持立即更新或每天按上海时间自动安装；更新会短暂重启服务。"
+	}
+	return "unsupported", "当前平台不支持原地安装，请通过原部署方式更新。"
 }
 
 func parseVersion(tag string) (parsedVersion, bool) {
