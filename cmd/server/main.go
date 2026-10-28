@@ -809,6 +809,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		AllowedModels:    newAllowedModels,
 		AllowlistEnabled: newAllowlistEnabled,
 		ModelAliases:     livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
+		ModelFallback:    newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 
@@ -86,9 +87,31 @@ func normalizeEmbeddingsResponse(raw []byte, want int) ([]byte, error) {
 		return nil, fmt.Errorf("上游返回 %d 条向量，与输入 %d 条不符", len(items), want)
 	}
 	out := make([]map[string]any, len(items))
+	seen := make(map[int]bool, len(items))
 	for i, it := range items {
+		vector, ok := it["embedding"].([]any)
+		if !ok || len(vector) == 0 {
+			return nil, fmt.Errorf("上游 data[%d] 缺少非空数值向量", i)
+		}
+		for _, value := range vector {
+			if _, ok := value.(float64); !ok {
+				return nil, fmt.Errorf("上游 data[%d] 向量含非数值元素", i)
+			}
+		}
+		index := i
+		if value, present := it["index"]; present {
+			n, ok := value.(float64)
+			if !ok || n < 0 || n >= float64(want) || math.Trunc(n) != n {
+				return nil, fmt.Errorf("上游 data[%d] 下标无效", i)
+			}
+			index = int(n)
+		}
+		if seen[index] {
+			return nil, fmt.Errorf("上游向量下标 %d 重复", index)
+		}
+		seen[index] = true
 		it["object"] = "embedding"
-		it["index"] = i
+		it["index"] = index
 		out[i] = it
 	}
 	data, err := json.Marshal(out)
@@ -107,9 +130,13 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 			"嵌入端点未开启：请在面板配置里打开 features.embeddings_enabled（默认关闭）")
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, (8<<20)+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	if len(raw) > 8<<20 {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body exceeds 8 MiB")
 		return
 	}
 	var req embeddingsRequest
@@ -139,6 +166,10 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 	}
 	if bare == "" {
 		bare = model
+	}
+	if !h.allowedModel(realm, bare) || h.hiddenModel(realm, bare) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable", "model is unavailable by gateway configuration, try another model")
+		return
 	}
 
 	tried := map[string]bool{}
@@ -171,6 +202,10 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 		var ue *upstream.Error
 		if errors.As(err, &ue) {
+			if ue.Kind == upstream.ErrUpstreamBusy {
+				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_busy", ue.Msg)
+				return
+			}
 			h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, "", ue)
 			// 请求级错误（参数/内容/模型权限）：换号必然同样被拒，fail-fast 保住池子。
 			if requestLevelFailFastKind(ue.Kind) {

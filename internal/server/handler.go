@@ -842,7 +842,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return ""
 		}
 		to := m[curModel]
-		if to == "" || to == curModel || fallbackTried[to] {
+		if to == "" || to == curModel || fallbackTried[to] || !h.allowedModel(realm, to) || h.hiddenModel(realm, to) {
 			return ""
 		}
 		return to

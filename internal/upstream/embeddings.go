@@ -81,12 +81,12 @@ func (c *Client) Embeddings(ctx context.Context, a *auth.Auth, model string, inp
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
 	if env.Code != 0 {
-		kind := Classify(resp.StatusCode, env.Msg)
+		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
 		return nil, &Error{Kind: kind, Status: resp.StatusCode,
-			Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+			Msg: truncate(string(raw), 200)}
 	}
 	return json.RawMessage(raw), nil
 }
