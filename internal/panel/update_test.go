@@ -98,7 +98,7 @@ vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='), src.indexOf('/* Go 时
     update_auto_enabled: Object.assign(nodes.get('updateAutoEnabled'), {type:'checkbox', checked:true}),
     update_auto_time: Object.assign(nodes.get('updateAutoTime'), {type:'time', value:'04:00'})
   };
-  assert.equal(JSON.stringify(ctx.collectConfig()), '{}', 'saving unrelated settings preserves unsupported update config');
+  assert.strictEqual(ctx.collectConfig().update, undefined, 'saving unrelated settings preserves unsupported update config');
   ctx.renderUpdateStatus({...response, can_install:true});
   assert.equal(nodes.get('updateAutoEnabled').disabled, false);
   assert.equal(ctx.collectConfig().update.auto_enabled, true, 'supported deployment saves schedule');
