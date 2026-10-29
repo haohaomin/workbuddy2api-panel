@@ -20,6 +20,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
@@ -202,8 +203,14 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 		}
 		var ue *upstream.Error
 		if errors.As(err, &ue) {
+			// 6020/6021 渠道级队列：上游对本形态本身回 429（6020 带 data.retry_after）。
+			// 与 chat 链路同口径（PR #108）：429 + Retry-After，不换号（全局队列，换谁都撞），
+			// 也不罚号（applyErrorPolicy 的 ErrUpstreamBusy 分支零动作）。
 			if ue.Kind == upstream.ErrUpstreamBusy {
-				writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_busy", ue.Msg)
+				if ue.RetryAfter > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(ue.RetryAfter.Seconds()))))
+				}
+				writeOpenAIError(w, http.StatusTooManyRequests, "upstream_busy", ue.Msg)
 				return
 			}
 			h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, "", ue)

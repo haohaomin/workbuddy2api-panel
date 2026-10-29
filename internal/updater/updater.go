@@ -34,6 +34,8 @@ const (
 
 // 更新流程的时间参数集中在这里，测试可注入短值。
 var (
+	// exeReleaseBudget 删刚跑过的 exe 的重试预算，兼容 Windows 映像句柄延迟释放。
+	exeReleaseBudget = 2 * time.Second
 	// downloadStallWindow 下载「N 秒无新字节」卡死守卫窗口。
 	downloadStallWindow = 30 * time.Second
 	// installWatchdog Install「成功」后，等 helper 完成替换的看门狗期限。
@@ -44,6 +46,20 @@ var (
 	// 生命周期（下载+替换+观察窗口）远短于该值，不会误删在途更新。
 	staleTempAge = 6 * time.Hour
 )
+
+// childGrace 生效的健康观察窗口。集成测试通过夹具环境变量缩短等待，
+// 普通运行忽略该变量，避免部署环境意外关闭启动验证。
+func childGrace() time.Duration {
+	if os.Getenv("WB2API_UPDATE_FIXTURE") == "" {
+		return childGraceWindow
+	}
+	if v := strings.TrimSpace(os.Getenv("WB2API_UPDATE_GRACE_MS")); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms >= 0 && ms <= 60000 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return childGraceWindow
+}
 
 // Settings controls the optional daily automatic install.
 type Settings struct {
@@ -593,7 +609,7 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 		if err := waitForProcessExit(pid, 60*time.Second); err != nil {
 			return true, err
 		}
-		return true, os.Remove(args[3])
+		return true, removeFileRetrying(args[3], exeReleaseBudget)
 	}
 	if len(args) < 7 || args[1] != selfUpdateArg {
 		return false, nil
@@ -651,7 +667,7 @@ func HandleSelfUpdate(args []string) (handled bool, err error) {
 	}
 	_ = os.Remove(stagePath)
 	replaced = true
-	if safe, err := startVerified(targetCommand(), 30*time.Second, childGraceWindow); err != nil {
+	if safe, err := startVerified(targetCommand(), 30*time.Second, childGrace()); err != nil {
 		if !safe {
 			cleanupHelper()
 			return true, err
@@ -700,6 +716,26 @@ func startChild(cmd *exec.Cmd) error {
 	return cmd.Process.Release()
 }
 
+// removeFileRetrying handles the short Windows interval in which a terminated
+// process still holds its executable image section.
+func removeFileRetrying(path string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	wait := 20 * time.Millisecond
+	for {
+		err := os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(wait)
+		if wait < 160*time.Millisecond {
+			wait *= 2
+		}
+	}
+}
+
 func replaceBinary(stagePath, targetPath string) error {
 	_, cleanup, err := replaceBinaryWithRollback(stagePath, targetPath)
 	if err != nil {
@@ -717,6 +753,9 @@ func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() err
 	if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
 	}
+	if err := removeFileRetrying(backup, exeReleaseBudget); err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
 	if err := os.Rename(targetPath, backup); err != nil {
 		return nil, nil, err
 	}
@@ -725,7 +764,7 @@ func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() err
 		if restored {
 			return nil
 		}
-		if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
+		if err := removeFileRetrying(targetPath, exeReleaseBudget); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		if err := os.Rename(backup, targetPath); err != nil {
@@ -735,7 +774,9 @@ func replaceBinaryWithRollback(stagePath, targetPath string) (restore func() err
 		return nil
 	}
 	cleanup = func() {
-		_ = os.Remove(backup)
+		if err := removeFileRetrying(backup, exeReleaseBudget); err != nil {
+			log.Printf("WARN: [updater] 清理回滚备份 %s 失败: %v", backup, err)
+		}
 	}
 	if err := os.Rename(stagePath, targetPath); err != nil {
 		return nil, nil, errors.Join(err, restore())

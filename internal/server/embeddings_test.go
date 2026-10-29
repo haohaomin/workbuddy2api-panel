@@ -143,11 +143,15 @@ func TestEmbeddingsPreservesUpstreamIndices(t *testing.T) {
 }
 
 func TestEmbeddingsQueueDoesNotRotate(t *testing.T) {
+	// 6020/6021 是全局队列：换号只会多撞一次墙。终态 429（与 chat 同口径），不罚号不轮转。
 	for _, status := range []int{200, 429} {
-		f := &embedFake{status: status, body: `{"code":6020,"msg":"queue.waiting.title"}`}
+		f := &embedFake{status: status, body: `{"code":6020,"msg":"queue.waiting.title","data":{"retry_after":40}}`}
 		rec := postEmbeddings(embedHandler(t, f, true), `{"model":"bge-m3","input":"a"}`)
-		if rec.Code != 503 || len(f.paths) != 1 {
+		if rec.Code != 429 || len(f.paths) != 1 {
 			t.Errorf("queue status=%d: response=%d calls=%d", status, rec.Code, len(f.paths))
+		}
+		if got := rec.Header().Get("Retry-After"); got != "40" {
+			t.Errorf("queue status=%d: Retry-After=%q want 40", status, got)
 		}
 	}
 }
