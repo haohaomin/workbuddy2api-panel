@@ -12,6 +12,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${APP_VE
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit
 
 FROM alpine:3.20
+ARG APP_VERSION=dev
+LABEL io.workbuddy2api.version=${APP_VERSION}
 # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
 RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
  && adduser -D -u 10001 app \

@@ -1,7 +1,9 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,11 +67,16 @@ func TestUpdateFrontendStates(t *testing.T) {
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const nodes = new Map();
+const timers = new Map();
+let timerID = 0;
 let response, fail = false, navigated;
 const ctx = {
   $: id => { if (!nodes.has(id)) nodes.set(id, {textContent:'', scrollIntoView(){}}); return nodes.get(id); },
   api: async () => { if(fail) throw Error('offline'); return response; },
-  toast(){}, confirm: () => true, go: v => { navigated = v; }
+  toast(){}, confirm: () => true, go: v => { navigated = v; },
+  AbortController,
+  setTimeout: (fn, delay) => { timers.set(++timerID, {fn, delay}); return timerID; },
+  clearTimeout: id => timers.delete(id)
 };
 vm.createContext(ctx);
 vm.runInContext('let updateData = null, updateBusy = false;\n' +
@@ -111,6 +118,35 @@ vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='), src.indexOf('/* Go 时
   ctx.renderUpdateStatus(response.status);
   assert.equal(nodes.get('btnUpdateInstall').disabled, true);
   assert.equal(nodes.get('btnUpdateCheck').disabled, true);
+  response = {deployment:'docker_agent', current_version:'dev', can_install:true, checking:true, message:'正在下载镜像'};
+  ctx.renderUpdateStatus(response);
+  assert.equal(nodes.get('updateNote').textContent, '正在下载镜像');
+  assert.equal(nodes.get('btnUpdateCheck').disabled, true);
+  assert.equal(nodes.get('updateAutoTime').disabled, true, 'Docker never enables the native daily schedule');
+  assert.strictEqual(ctx.collectConfig().update, undefined);
+  ctx.renderUpdateStatus({...response, checking:false, phase:'rolled_back', last_error:'启动失败；已回滚到旧镜像'});
+  assert(nodes.get('updateNote').textContent.includes('已回滚'));
+  assert.equal(nodes.get('btnUpdateCheck').disabled, false);
+  assert.equal(ctx.updateTarget({deployment:'docker_agent', latest_image:'sha256:abcdef1234567890'}), '镜像 abcdef123456');
+  assert.equal(timers.size, 1, 'overview renders must not duplicate the Docker polling loop');
+  const tick = async () => {
+    const [id, timer] = [...timers.entries()].find(([,t]) => t.delay === 3000);
+    timers.delete(id);
+    await timer.fn();
+  };
+  response = {...response, checking:false, installing:true};
+  ctx.renderUpdateStatus(response);
+  fail = true;
+  await tick();
+  assert(nodes.get('updateNote').textContent.includes('重连'));
+  assert.equal(timers.size, 1, 'transient disconnect keeps polling');
+  fail = false;
+  response = {...response, installing:false, phase:'unavailable', can_install:false};
+  await tick();
+  assert.equal(timers.size, 1, 'agent reconnect continues even with overview refresh disabled');
+  response = {...response, phase:'succeeded', message:'更新成功'};
+  await tick();
+  assert.equal(timers.size, 0, 'finished jobs stop the polling loop');
 })().catch(e => { console.error(e); process.exitCode = 1; });
 `
 	path := filepath.Join(t.TempDir(), "update.cjs")
@@ -119,5 +155,70 @@ vm.runInContext(src.slice(src.indexOf('const CFG_MAP ='), src.indexOf('/* Go 时
 	}
 	if out, err := exec.Command(node, path, "app.js").CombinedOutput(); err != nil {
 		t.Fatalf("node: %v\n%s", err, out)
+	}
+}
+
+func TestDockerUpdateAPI(t *testing.T) {
+	// Short path: macOS Unix sockets have a small path limit.
+	dir, err := os.MkdirTemp("", "wb-agent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "s")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	calls := make(chan string, 10)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls <- r.Method + " " + r.URL.Path
+		writeJSON(w, http.StatusAccepted, updater.Status{CanInstall: true, Installing: r.URL.Path == "/install", Checking: r.URL.Path == "/check"})
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+	p := New(Config{Version: "dev", APIKey: "test-key", DockerUpdater: updater.NewDockerClient(socket)})
+	for _, action := range []string{"check", "install"} {
+		for _, key := range []string{"", "wrong", "test-key"} {
+			req := httptest.NewRequest(http.MethodPost, "/panel/api/update/"+action, nil)
+			req.Header.Set("Authorization", "Bearer "+key)
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, req)
+			if key != "test-key" {
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("anonymous: %d", rec.Code)
+				}
+				select {
+				case call := <-calls:
+					t.Fatalf("unauthorized call: %s", call)
+				default:
+				}
+			} else {
+				if rec.Code != http.StatusAccepted {
+					t.Fatalf("%s: %d %s", action, rec.Code, rec.Body.String())
+				}
+				if call := <-calls; call != "POST /"+action {
+					t.Fatalf("wrong call: %s", call)
+				}
+			}
+		}
+	}
+	p.cfg.APIKey = ""
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/panel/api/update/install", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("unconfigured key: %d", rec.Code)
+	}
+	s := p.dockerUpdateSnapshot(context.Background())
+	if s.CanInstall || s.AutoActive || s.Deployment != "docker_agent" {
+		t.Fatalf("bad status: %+v", s)
+	}
+	<-calls
+	p.cfg.APIKey = "test-key"
+	server.Close()
+	s = p.dockerUpdateSnapshot(context.Background())
+	if s.CanInstall || s.LastError == "" || s.Phase != "unavailable" {
+		t.Fatalf("offline: %+v", s)
 	}
 }

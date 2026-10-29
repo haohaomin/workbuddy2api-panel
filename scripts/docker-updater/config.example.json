@@ -1,0 +1,11 @@
+{
+  "project_directory": "/opt/workbuddy2api-panel",
+  "project_name": "workbuddy2api-panel",
+  "compose_files": ["docker-compose.yml", "docker-compose.web-update.yml"],
+  "service": "wb2api",
+  "container_port": 7863,
+  "socket": "/run/workbuddy-updater/agent.sock",
+  "socket_gid": 10001,
+  "state_directory": "/var/lib/workbuddy-updater",
+  "ready_timeout": 90
+}

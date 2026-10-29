@@ -2027,6 +2027,7 @@ func TestAppJSAllCalledFunctionsDefined(t *testing.T) {
 		"alert": true, "confirm": true, "prompt": true, "structuredClone": true,
 		// 标准 Web API / 常见回调参数（不是本文件定义的函数）
 		"FormData": true, "TextEncoder": true, "TextDecoder": true, "Blob": true,
+		"AbortController": true,
 		"URLSearchParams": true, "URL": true, "matchMedia": true, "open": true,
 		"addEventListener": true, "removeEventListener": true,
 		// Promise 构造参数 / 回调形参：在定义处以参数形式出现，不在顶层定义

@@ -443,6 +443,7 @@ func main() {
 		StickyCount:      sessCount,
 		Version:          appVersion,
 		Updater:          updateManager,
+		DockerUpdater:    updater.NewDockerClient(os.Getenv("WB2A_DOCKER_UPDATER_SOCKET")),
 		PollIntervalSec:  cfg.Panel.PollIntervalSec,
 		Live:             live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：

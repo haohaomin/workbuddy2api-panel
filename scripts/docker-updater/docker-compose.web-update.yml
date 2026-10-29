@@ -1,0 +1,9 @@
+# Add this file to the SAME Compose project as the existing gateway.
+# Change wb2api to the service name used by your existing compose file.
+services:
+  wb2api:
+    image: ghcr.io/haohaomin/workbuddy2api-panel:latest
+    environment:
+      WB2A_DOCKER_UPDATER_SOCKET: /run/workbuddy-updater/agent.sock
+    volumes:
+      - /run/workbuddy-updater:/run/workbuddy-updater:ro

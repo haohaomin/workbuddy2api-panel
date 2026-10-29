@@ -67,6 +67,11 @@ type Status struct {
 	AutoActive      bool   `json:"auto_active"`
 	Deployment      string `json:"deployment"`
 	InstallHint     string `json:"install_hint"`
+	Checking        bool   `json:"checking,omitempty"`
+	Phase           string `json:"phase,omitempty"`
+	Message         string `json:"message,omitempty"`
+	CurrentImage    string `json:"current_image,omitempty"`
+	LatestImage     string `json:"latest_image,omitempty"`
 }
 
 type release struct {

@@ -624,6 +624,33 @@ function displayVersion(version) {
   return value === 'dev' ? 'dev' : 'v' + value;
 }
 
+let dockerUpdateTimer = null;
+function updateTarget(update) {
+  if (update.deployment === 'docker_agent' && !update.latest_version) {
+    return '镜像 ' + String(update.latest_image || '').replace(/^sha256:/, '').slice(0, 12);
+  }
+  return displayVersion(update.latest_version);
+}
+
+function pollDockerUpdate() {
+  if (dockerUpdateTimer !== null) return;
+  dockerUpdateTimer = setTimeout(async () => {
+    // Keep the timer marked active until this request completes; overview polling
+    // can render concurrently and must not create another update polling loop.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      renderUpdateStatus(await api('update', { signal: controller.signal }));
+    } catch (_) {
+      $('updateNote').textContent = '容器切换中或连接暂时中断，正在重连…';
+    } finally {
+      clearTimeout(timeout);
+      dockerUpdateTimer = null;
+      if (updateData?.deployment === 'docker_agent' && (updateData.installing || updateData.checking || updateData.phase === 'unavailable')) pollDockerUpdate();
+    }
+  }, 3000);
+}
+
 function renderUpdateStatus(update) {
   if (!update) return;
   updateData = update;
@@ -632,28 +659,31 @@ function renderUpdateStatus(update) {
   $('navVer').textContent = local;
   $('navUpdate').hidden = !update.update_available;
   $('navUpdate').textContent = '有更新';
-  $('navUpdate').title = update.update_available ? '发现 v' + update.latest_version + '，点击查看更新操作' : '';
+  $('navUpdate').title = update.update_available ? '发现 ' + updateTarget(update) + '，点击查看更新操作' : '';
   renderUpdateCapabilities();
   const note = $('updateNote');
-  if (update.installing) {
-    note.textContent = '正在准备更新…';
+  if (update.installing || update.checking) {
+    note.textContent = update.message || '正在准备更新…';
   } else if (update.last_error) {
     note.textContent = '更新失败：' + update.last_error;
+  } else if (update.deployment === 'docker_agent' && update.message) {
+    note.textContent = update.message + (update.update_available ? ' · ' + updateTarget(update) : '');
   } else if (update.update_available) {
-    note.textContent = '发现新版本 v' + update.latest_version + (update.can_install ? '' : ' · 请手动更新');
+    note.textContent = '发现新版本 ' + updateTarget(update) + (update.can_install ? '' : ' · 请手动更新');
   } else if (update.latest_version) {
     note.textContent = '已是最新版本 · v' + update.latest_version;
   } else {
     note.textContent = '尚未检查';
   }
   $('btnUpdateInstall').hidden = !update.update_available || !update.can_install;
-  $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
+  $('btnUpdateInstall').disabled = updateBusy || !!update.installing || !!update.checking;
   $('btnUpdateRelease').hidden = !update.update_available || !!update.can_install || !update.release_url;
-  $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+  $('btnUpdateCheck').disabled = updateBusy || !!update.installing || !!update.checking;
+  if (update.deployment === 'docker_agent' && (update.installing || update.checking || update.phase === 'unavailable')) pollDockerUpdate();
 }
 
 function renderUpdateCapabilities() {
-  const supported = !!updateData?.can_install;
+  const supported = !!updateData?.can_install && updateData?.deployment !== 'docker_agent';
   $('updateInstallHint').textContent = updateData?.install_hint || '当前部署不支持网页安装，请通过原部署方式更新。';
   for (const id of ['updateAutoEnabled', 'updateAutoTime']) {
     const el = $(id);
@@ -663,7 +693,7 @@ function renderUpdateCapabilities() {
 }
 
 async function checkForUpdates() {
-  if (updateBusy || updateData?.installing) return;
+  if (updateBusy || updateData?.installing || updateData?.checking) return;
   updateBusy = true;
   const button = $('btnUpdateCheck');
   button.disabled = true;
@@ -671,8 +701,9 @@ async function checkForUpdates() {
   try {
     const update = await api('update/check', { method: 'POST' });
     renderUpdateStatus(update);
-    toast(update.update_available ? '发现新版本 v' + update.latest_version : '当前已是最新版本', update.update_available ? 'ok' : '');
+    toast(update.checking ? '正在后台下载并检查最新镜像，当前服务保持运行' : (update.update_available ? '发现新版本 ' + updateTarget(update) : '当前已是最新版本'), update.update_available ? 'ok' : '');
   } catch (e) {
+    if (updateData?.deployment === 'docker_agent') renderUpdateStatus({...updateData, phase:'unavailable', last_error:e.message});
     try { renderUpdateStatus(await api('update')); } catch (_) {}
     toast('检查更新失败：' + e.message, 'err');
   } finally {
@@ -683,8 +714,8 @@ async function checkForUpdates() {
 }
 
 async function installUpdate() {
-  if (updateBusy || !updateData || updateData.installing || !updateData.can_install || !updateData.update_available) return;
-  if (!confirm('将安装 v' + updateData.latest_version + ' 并重启服务，期间服务会短暂中断。请避开正在处理的请求，确认继续？')) return;
+  if (updateBusy || !updateData || updateData.installing || updateData.checking || !updateData.can_install || !updateData.update_available) return;
+  if (!confirm('将安装 ' + updateTarget(updateData) + ' 并重启服务，期间服务会短暂中断。请避开正在处理的请求，确认继续？')) return;
   const button = $('btnUpdateInstall');
   updateBusy = true;
   button.disabled = true;
@@ -692,9 +723,16 @@ async function installUpdate() {
   try {
     const result = await api('update/install', { method: 'POST' });
     renderUpdateStatus(result.status);
-    toast('更新已准备，服务即将重启', 'ok');
+    toast(result.status?.deployment === 'docker_agent' ? '宿主机已接管更新，正在重建容器' : '更新已准备，服务即将重启', 'ok');
   } catch (e) {
-    toast('更新失败：' + e.message, 'err');
+    // A container can disappear before returning 202. The host job may still be
+    // running: reconnect to learn its result instead of offering a second install.
+    if (updateData?.deployment === 'docker_agent') {
+      renderUpdateStatus({...updateData, can_install:false, phase:'unavailable', last_error:'正在重新连接以确认更新结果：' + e.message});
+      toast('更新请求未确认：' + e.message + '；正在重新查询状态', 'err');
+    } else {
+      toast('更新失败：' + e.message, 'err');
+    }
   } finally {
     updateBusy = false;
     if (updateData) renderUpdateStatus(updateData);

@@ -11,6 +11,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -49,6 +50,7 @@ type Config struct {
 	RedisMode        string // "upstash" / "noop"，仅观测透出
 	Version          string // 面板版本号（展示用）
 	Updater          *updater.Manager
+	DockerUpdater    *updater.DockerClient
 
 	// PollIntervalSec 前端自动刷新间隔（秒）。0 = 用前端缺省值。
 	// 面板每轮刷新会重建若干表格并打一批接口；账号多、或只是开着面板当监控用
@@ -346,7 +348,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":           p.cfg.Version,
 		"poll_interval_sec": p.cfg.PollIntervalSec,
-		"update":            p.updateSnapshot(),
+		"update":            p.updateSnapshot(r.Context()),
 		"uptime_sec":        int(time.Since(p.started).Seconds()),
 		"auth_required":     p.apiKey() != "",
 		"redis_mode":        p.cfg.RedisMode,
@@ -386,7 +388,10 @@ func (p *Panel) balanceRefreshedAt() time.Time {
 	return p.cfg.Scheduler.BalanceRefreshedAt()
 }
 
-func (p *Panel) updateSnapshot() any {
+func (p *Panel) updateSnapshot(ctx context.Context) any {
+	if p.cfg.DockerUpdater != nil {
+		return p.dockerUpdateSnapshot(ctx)
+	}
 	if p.cfg.Updater == nil {
 		return nil
 	}
