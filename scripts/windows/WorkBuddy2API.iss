@@ -1,10 +1,18 @@
 ; Inno Setup template for the Windows portable server build.
 ; The installer stores the executable under LocalAppData and never removes
 ; config.json, auths/ or data/ during uninstall.
-#define AppVersion GetStringDefine("AppVersion", "0.0.0")
-#define InputDir GetStringDefine("InputDir", ".")
-#define OutputDir GetStringDefine("OutputDir", ".")
-#define OutputName GetStringDefine("OutputName", "WorkBuddy2API-Setup-windows")
+#ifndef AppVersion
+#define AppVersion "0.0.0"
+#endif
+#ifndef InputDir
+#define InputDir "."
+#endif
+#ifndef OutputDir
+#define OutputDir "."
+#endif
+#ifndef OutputName
+#define OutputName "WorkBuddy2API-Setup-windows"
+#endif
 
 [Setup]
 AppId={{C3F1F26F-6D8E-4A86-9E6B-3D4A5D10F0C7}
