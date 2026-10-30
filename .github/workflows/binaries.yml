@@ -218,12 +218,13 @@ jobs:
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
           $template = Join-Path $PWD 'scripts\windows\WorkBuddy2API.iss'
           foreach ($arch in @('amd64', 'arm64')) {
-            $artifact = Get-ChildItem (Join-Path $PWD 'release-assets') -Directory -Recurse |
-              Where-Object { $_.Name -eq "wb2api-panel-$env:VERSION-windows-$arch" } |
+            # download-artifact may flatten or preserve the artifact directory;
+            # identify the executable by its architecture path instead.
+            $binary = Get-ChildItem (Join-Path $PWD 'release-assets') -Filter 'wb2api.exe' -File -Recurse |
+              Where-Object { $_.FullName -match "windows-$arch|$arch" } |
               Select-Object -First 1
-            if (-not $artifact) { throw "Windows $arch artifact directory not found" }
-            $inputDir = (Get-ChildItem $artifact.FullName -Filter 'wb2api.exe' -Recurse | Select-Object -First 1).Directory.FullName
-            if (-not $inputDir) { throw "wb2api.exe not found in $($artifact.FullName)" }
+            if (-not $binary) { throw "Windows $arch wb2api.exe not found under release-assets" }
+            $inputDir = $binary.Directory.FullName
             & $iscc "/DAppVersion=$env:VERSION" "/DInputDir=$inputDir" "/DOutputDir=$PWD\dist" "/DOutputName=WorkBuddy2API-Setup-windows-$arch" $template
             if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed for $arch" }
           }
