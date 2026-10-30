@@ -1,4 +1,23 @@
-# WorkBuddy2API Panel++
+<p align="center">
+  <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy2API" width="120">
+</p>
+
+<h1 align="center">WorkBuddy2API Panel++</h1>
+
+<p align="center">
+  <b>把腾讯 WorkBuddy / CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
+  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 工具与视觉 · 联网检索 · 定时任务 · 流式 / 非流式<br>
+  <b>同步上游功能更新 · macOS 桌面应用 · 一键更新与回滚 · 公网部署</b>
+</p>
+
+<p align="center">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26.10-00ADD8?logo=go&logoColor=white&style=flat-square">
+  <img alt="API" src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic-412991?style=flat-square">
+  <img alt="Deploy" src="https://img.shields.io/badge/Deploy-macOS_App%20%7C%20Binary%20%7C%20Docker-2496ED?style=flat-square">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
+</p>
+
+---
 
 基于 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 的个人增强分支：**持续同步上游全部功能更新，并在此基础上扩充个人功能**，包括 macOS 桌面应用、一键更新和服务器部署。
 
@@ -120,3 +139,7 @@ open dist/WorkBuddy2API.app
 本仓直接基于 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)，继承自 `linguo2625469/workbuddy2api-panel` 和原始项目 `Sliverkiss/workbuddy2api`。感谢上游作者与贡献者，原作者版权声明保留在 [LICENSE](LICENSE) 中。
 
 本项目采用 MIT 许可，是非官方工具，与腾讯无隶属关系。请仅使用获得授权的账号，并遵守相关服务条款；上游接口变化可能导致功能不可用。
+
+## Star 趋势
+
+[![Star History Chart](https://api.star-history.com/svg?repos=haohaomin/workbuddy2api-panel&type=Date)](https://star-history.com/#haohaomin/workbuddy2api-panel&Date)
