@@ -34,7 +34,7 @@ WorkBuddy2API 将 WorkBuddy / CodeBuddy 账号接入自托管网关，提供 Ope
 | **macOS 原生 App** | 提供 Apple 芯片和 Intel 的 DMG。保留控制窗口，支持启动 / 停止服务、打开面板、查看日志和退出应用。 |
 | **桌面一键更新** | 检查新版、下载校验、替换 App 并重启；启动失败时尝试回滚，保留用户数据。支持清除旧版应用备份。 |
 | **按部署方式更新** | Web 面板区分桌面应用、独立二进制和容器部署，显示对应更新能力与操作提示。独立二进制更新增加启动就绪校验。 |
-| **Docker 网页更新器** | 可选的宿主机更新服务，只重建指定的 WorkBuddy 容器；校验新容器、失败时尝试恢复旧镜像。需要一次性安装，不是普通容器默认具备的功能。 |
+| **Docker 网页更新器** | 可选的宿主机更新服务，只重建指定的 WorkBuddy 容器；校验新容器、失败时尝试恢复旧镜像。更新成功后清理更早的镜像备份，并保留上一版用于回滚。需要一次性安装。 |
 | **自动构建发布** | 推送 `main` 后自动构建并发布 Windows / Linux 安装包、macOS DMG 与更新包；GHCR 工作流独立发布多架构镜像。使用上海时间版本号。 |
 | **公网部署模板** | 提供 WorkBuddy + New API + PostgreSQL + Redis + Caddy 的 Compose 模板，覆盖配置迁移、HTTPS、用户 API Key 分发、用量管理和备份。 |
 
@@ -85,6 +85,8 @@ ghcr.io/haohaomin/workbuddy2api-panel:latest
 ```
 
 支持 `linux/amd64` 与 `linux/arm64`。生产部署建议固定已验收的镜像版本或 digest。
+
+**第一次部署注意：容器能运行，不代表已开启网页更新。** 只拉取镜像或完成公网部署模板，默认仍通过 Compose 更新。想在网页点击更新，必须再完成 [宿主机更新器的一次性安装和验收](scripts/docker-updater/README.md)。之后在 **WorkBuddy 面板 → 配置 → 版本与更新** 操作；不是 New API 的管理页面。
 
 - **公网入口、用户 Key 和用量管理**：按 [部署指南](deploy/public-gateway/README.md) 配置 New API 与 Caddy。WorkBuddy 保持在私网，由 New API 向用户分发独立令牌。
 - **从网页更新 Docker 服务**：按 [Docker 网页更新器指南](scripts/docker-updater/README.md) 安装宿主机服务。仅支持手动触发，不执行每日定时安装；更新期间会短暂中断，失败时尝试镜像回滚。

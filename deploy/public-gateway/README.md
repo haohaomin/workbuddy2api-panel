@@ -2,6 +2,8 @@
 
 此目录提供通用部署模板，账号和密码需在目标服务器配置。假设一台 Linux 服务器已安装 Docker Engine 和 Compose v2，80/443 未被其他网站占用。若已有宝塔、Nginx 或 Caddy，应复用原反向代理，不要再抢占端口。
 
+**本模板默认通过 Compose 更新 WorkBuddy，不会自动启用网页更新。** 首次部署完成后，如需在 WorkBuddy 面板点击更新，再完成第 7 节的一次性配置；仅拉取新镜像不会安装宿主机更新服务。
+
 ## 1. 确认要迁移的配置
 
 本机检查到两套配置：
@@ -173,6 +175,8 @@ Caddy 仅代理 New API，不把 WorkBuddy 管理面板映射到公网。WorkBud
 
 ## 6. 数据备份与更新
 
+以下普通 Compose 命令用于尚未启用网页更新器的部署。启用第 7 节后，凡是可能重建 WorkBuddy 的操作，都要保留补充 Compose 文件和已生成的镜像固定文件，按 [网页更新器的人工维护说明](../../scripts/docker-updater/README.md#固定版本人工恢复与排错) 执行，不能再直接照抄本节的普通 `up` 命令。
+
 需要备份：`wb2api/`、`.env`、Compose/Caddy 配置、`newapi-data/`、`newapi-logs/`，以及 PostgreSQL 数据库。New API 用户、额度、渠道和账单主要在 PostgreSQL，不在 WorkBuddy 的 config.json 中。
 
 首次迁移时可以不带旧 `data/`；服务器投入使用后，备份仍建议包含新生成的 `wb2api/data/`，以保留服务器上的运行状态和历史记录。
@@ -201,6 +205,25 @@ docker compose ps workbuddy
 
 此模板默认通过 Compose 更新镜像；如需网页触发更新，另行配置 [Docker 网页更新器](../../scripts/docker-updater/README.md)。WorkBuddy 更新源始终是 `haohaomin/workbuddy2api-panel`。New API 独立从其官方镜像更新。
 
+## 7. 启用 WorkBuddy 网页更新（可选）
+
+完成前面的部署后，在 Linux 宿主机按 [Docker 网页更新器指南](../../scripts/docker-updater/README.md) 获取源码、安装服务并验收。只复制本目录到服务器时，还没有 `scripts/docker-updater/`，需按该指南补取；源码目录与 `~/ai-gateway` 部署目录是两回事。
+
+本模板对应的配置如下，以容器标签和实际路径为准：
+
+| 更新器配置 | 本模板的填写方式 |
+| --- | --- |
+| `project_directory` | `cd ~/ai-gateway && pwd` 得到的绝对路径，不填写 `~` |
+| `project_name` | `wb2api-public` |
+| `compose_files` | `["compose.yml", "docker-compose.web-update.yml"]`；若原部署还有其他补充文件，保留它们的原顺序 |
+| `service` | `workbuddy`，补充文件里的服务名也必须一致 |
+| `container_port` | `7863` |
+| `socket_gid` | 默认 `10001`；修改过容器运行用户时按实际 GID 填写 |
+
+使用指南中的命令时，把通用示例的 `docker-compose.yml` / `wb2api` / 项目目录与项目名替换为上表的值，不能另起一个项目。启动宿主机服务后，仅重建 `workbuddy` 以加入 socket 挂载和环境变量，保留原 `./wb2api:/app/user-data` 数据挂载。
+
+通过第 4 节的 SSH 隧道访问 WorkBuddy 面板，在 **配置 → 版本与更新** 验收：应显示 Docker 网页更新，点击检查后能够完成镜像下载或提示已是最新。公网 New API 页面没有这个 WorkBuddy 更新入口。以后从这里手动更新 WorkBuddy；New API、数据库和 Caddy 不由该更新器升级。
+
 ## 参考与验证范围
 
 - New API 官方 Compose：https://github.com/QuantumNous/new-api/blob/main/docker-compose.yml
@@ -208,4 +231,4 @@ docker compose ps workbuddy
 - OpenAI 渠道 URL 拼接：https://github.com/QuantumNous/new-api/blob/main/relay/channel/openai/adaptor.go
 - Caddy HTTPS：https://caddyserver.com/docs/automatic-https
 
-此模板根据当前仓库和上述官方配置编写。本机没有 Docker，未做容器启动或公网联调；需要在目标服务器执行 `docker compose config --quiet` 并按上述步骤验收。
+此模板根据当前仓库和上述官方配置编写。已在一台 Linux ARM64 服务器的现有 Compose 部署上验证更新器安装、容器接线、鉴权、服务重启后重连和镜像检查/下载；这不是全新空白服务器的全流程验收，也未通过生产故障注入验证回滚。首次部署仍需在目标服务器执行 `docker compose config --quiet`，并按上述步骤验收实际调用、网页更新和数据保留。

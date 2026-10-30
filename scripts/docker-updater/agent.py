@@ -192,6 +192,40 @@ class Agent:
         self.compose("up", "-d", "--no-deps", "--no-build", "--pull", "never",
                      "--force-recreate", self.service, pinned=True)
 
+    def cleanup_old_backups(self, protected_images):
+        rendered = self.run(
+            "image", "ls", "--no-trunc", "--filter",
+            "reference=workbuddy2api-managed:*", "--format", "{{json .}}",
+        )
+        backups = {}
+        prefix = "workbuddy2api-managed:"
+        for line in rendered.splitlines():
+            try:
+                image = json.loads(line)
+                tag = image.get("Repository", "") + ":" + image.get("Tag", "")
+                match = re.fullmatch(re.escape(prefix) + r"([0-9a-f]{64})", tag)
+                if not match:
+                    continue
+                image_id = "sha256:" + match.group(1)
+                if image.get("ID") not in (None, image_id):
+                    logging.warning("Skipping inconsistent managed image tag")
+                    continue
+                backups[tag] = image_id
+            except (json.JSONDecodeError, TypeError):
+                logging.warning("Skipping unreadable managed image entry")
+
+        removed, failures = 0, 0
+        for tag, image_id in backups.items():
+            if image_id in protected_images:
+                continue
+            try:
+                self.run("image", "rm", tag, timeout=60)
+                removed += 1
+            except Exception:
+                failures += 1
+                logging.warning("Could not remove one obsolete managed image backup")
+        return removed, failures
+
     def probe(self, container):
         # /healthz 503 is valid when no account is available. Require the application
         # identity and JSON shape; do not confuse account availability with startup.
@@ -243,6 +277,14 @@ class Agent:
             return
         self.save(_pending=False, phase="succeeded", message="更新成功，已通过启动检查",
                   current_image=target, update_available=False, last_error="")
+        removed, failures = self.cleanup_old_backups({target, self.state["_old"]})
+        message = "更新成功，上一版回滚镜像已保留"
+        if removed:
+            message += f"，已清理 {removed} 个更旧备份"
+        if failures:
+            message += f"，{failures} 个旧镜像清理失败，仍保留"
+        self.save(backup_cleanup_removed=removed, backup_cleanup_failures=failures,
+                  message=message)
 
     def rollback(self, reason):
         self.save(phase="rolling_back", message="启动检查失败，正在恢复旧镜像…", installing=True)

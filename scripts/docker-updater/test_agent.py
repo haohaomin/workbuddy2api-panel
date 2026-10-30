@@ -25,12 +25,29 @@ class FakeAgent(Agent):
         self.current = OLD
         self.remote = NEW
         self.calls = []
+        self.managed_images = {}
+        self.fail_image_removals = False
         self.fail_pull = False
         self.fail_ready = set()
         self.pull_gate = None
 
     def run(self, *args, timeout=120):
         self.calls.append(args)
+        if args[:2] == ("image", "tag"):
+            source, tag = args[2:]
+            image_id = source if source.startswith("sha256:") else self.managed_images[source]
+            self.managed_images[tag] = image_id
+            return ""
+        if args[:2] == ("image", "ls"):
+            return "\n".join(json.dumps({
+                "Repository": tag.rsplit(":", 1)[0], "Tag": tag.rsplit(":", 1)[1],
+                "ID": image_id,
+            }) for tag, image_id in sorted(self.managed_images.items()))
+        if args[:2] == ("image", "rm"):
+            if self.fail_image_removals:
+                raise RuntimeError("模拟镜像清理失败")
+            del self.managed_images[args[2]]
+            return ""
         if args[0] == "pull":
             if self.pull_gate:
                 self.pull_gate.wait(2)
@@ -77,6 +94,9 @@ class AgentTests(unittest.TestCase):
 
     def test_success_installs_checked_image_not_newer_remote(self):
         a = self.agent
+        stale = "sha256:" + "d" * 64
+        stale_tag = image_tag(stale)
+        a.managed_images[stale_tag] = stale
         a.check()
         self.assertTrue(a.snapshot()["update_available"])
         self.assertEqual(a.snapshot()["latest_version"], "2026.10.28.1200")
@@ -93,7 +113,27 @@ class AgentTests(unittest.TestCase):
         self.assertIn(str(a.override), up)
         self.assertFalse(any(c[0] in ("stop", "rm", "system") or "down" in c for c in a.calls))
         self.assertEqual(json.loads(a.override.read_text())["services"]["workbuddy"]["image"], image_tag(NEW))
+        self.assertNotIn(stale_tag, a.managed_images)
+        self.assertIn(image_tag(OLD), a.managed_images)
+        self.assertIn(image_tag(NEW), a.managed_images)
+        self.assertEqual(a.snapshot()["backup_cleanup_removed"], 1)
+        self.assertIn("上一版回滚镜像已保留", a.snapshot()["message"])
         self.assertNotIn("_old", a.snapshot())
+
+    def test_cleanup_failure_does_not_roll_back_a_healthy_update(self):
+        a = self.agent
+        stale = "sha256:" + "d" * 64
+        stale_tag = image_tag(stale)
+        a.managed_images[stale_tag] = stale
+        a.check()
+        a.fail_image_removals = True
+        a.install()
+        self.assertEqual(a.current, NEW)
+        self.assertEqual(a.snapshot()["phase"], "succeeded")
+        self.assertFalse(a.state["_pending"])
+        self.assertIn(stale_tag, a.managed_images)
+        self.assertEqual(a.snapshot()["backup_cleanup_failures"], 1)
+        self.assertIn("清理失败，仍保留", a.snapshot()["message"])
 
     def test_pull_failure_leaves_container_running_and_no_candidate(self):
         a = self.agent
@@ -108,6 +148,9 @@ class AgentTests(unittest.TestCase):
 
     def test_failed_start_rolls_back_pinned_old_image(self):
         a = self.agent
+        stale = "sha256:" + "d" * 64
+        stale_tag = image_tag(stale)
+        a.managed_images[stale_tag] = stale
         a.check()
         a.fail_ready = {NEW}
         a.work("install")
@@ -117,6 +160,8 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(a.state["_pending"])
         self.assertTrue(a.snapshot()["can_install"])
         self.assertEqual(json.loads(a.override.read_text())["services"]["workbuddy"]["image"], image_tag(OLD))
+        self.assertIn(stale_tag, a.managed_images)
+        self.assertFalse(any(c[:2] == ("image", "rm") for c in a.calls))
 
     def test_failed_rollback_blocks_new_jobs_and_keeps_journal(self):
         a = self.agent
