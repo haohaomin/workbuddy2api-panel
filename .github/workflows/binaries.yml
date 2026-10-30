@@ -193,7 +193,7 @@ jobs:
           if-no-files-found: error
 
   build-windows-installers:
-    needs: version
+    needs: [version, build]
     if: needs.version.outputs.needs_publish == 'true'
     runs-on: windows-latest
     env:
