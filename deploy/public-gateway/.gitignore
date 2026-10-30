@@ -1,0 +1,7 @@
+.env
+wb2api/
+newapi-data/
+newapi-logs/
+*.tar.gz
+*.dump
+.DS_Store

@@ -1,0 +1,125 @@
+name: wb2api-public
+services:
+  workbuddy:
+    image: ${WORKBUDDY_IMAGE:-ghcr.io/haohaomin/workbuddy2api-panel:latest}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    working_dir: /app/user-data
+    entrypoint: ["/app/wb2api"]
+    command: ["-config", "/app/user-data/config.json"]
+    environment:
+      TZ: Asia/Shanghai
+      WB2A_LISTEN: ":7863"
+    volumes:
+      - ./wb2api:/app/user-data
+    ports:
+      - "127.0.0.1:7863:7863"
+    stop_grace_period: 45s
+
+  new-api:
+    image: ${NEW_API_IMAGE:-calciumion/new-api:latest}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    command: ["--log-dir", "/app/logs"]
+    environment:
+      SQL_DSN: "postgresql://newapi:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/newapi"
+      REDIS_CONN_STRING: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD}@redis:6379"
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      SESSION_COOKIE_SECURE: ${SECURE_COOKIE:-false}
+      SESSION_COOKIE_TRUSTED_URL: ${TRUSTED_URL:-}
+      TRUSTED_PROXIES: "172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
+      ERROR_LOG_ENABLED: "true"
+      BATCH_UPDATE_ENABLED: "true"
+      NODE_NAME: "new-api-1"
+      TZ: Asia/Shanghai
+      STREAMING_TIMEOUT: "300"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./newapi-data:/data
+      - ./newapi-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/status | grep -o '\"success\":\\s*true' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 45s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_DB: newapi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U newapi -d newapi"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Set REDIS_PASSWORD}"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["public"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
