@@ -93,7 +93,7 @@ func main() {
 		}
 		return
 	}
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	cfgPath := flag.String("config", defaultConfigPath(), "配置文件路径（Windows 默认 %LOCALAPPDATA%\\WorkBuddy2API\\config.json；存在当前目录 config.json 时优先使用）")
 	flag.Parse()
 	// 实际生效的配置路径。必须在 flag.Parse() **之后**取值：flag.String 返回的指针
 	// 在 Parse 时才写入命令行值，此前取到的是默认值拷贝，-config 自定义路径时横幅

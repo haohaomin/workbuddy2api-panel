@@ -561,6 +561,7 @@ func Load(path string) (*Config, error) {
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
+	resolveManagedConfigPaths(c, path)
 	return c, nil
 }
 

@@ -59,7 +59,7 @@ Web 管理面板、浏览器登录、多账号调度、模型管理、工具与�
 
 ### Windows / Linux
 
-从 [Releases](https://github.com/haohaomin/workbuddy2api-panel/releases/latest) 下载对应系统和架构的 ZIP，解压后在该目录运行：
+从 [Releases](https://github.com/haohaomin/workbuddy2api-panel/releases/latest) 下载对应系统和架构的 ZIP，解压后运行。Windows 新安装会把配置、账号和运行数据放在 `%LOCALAPPDATA%\WorkBuddy2API\`；如果当前目录已有 `config.json`，则继续使用当前目录，兼容绿色版和旧部署。
 
 ```powershell
 # Windows
@@ -72,7 +72,7 @@ chmod +x ./wb2api
 ./wb2api
 ```
 
-首次运行会在工作目录生成 `config.json` 和随机 `api_key`。打开 `http://127.0.0.1:7863/panel/`，使用该密钥登录并添加账号。配置和运行数据保存在工作目录中。
+首次运行会生成 `config.json` 和随机 `api_key`。打开 `http://127.0.0.1:7863/panel/`，使用该密钥登录并添加账号。也可以显式指定配置文件：`wb2api.exe -config D:\WorkBuddy2API\config.json`。Windows 安装版不需要管理员权限即可更新用户目录中的程序。
 
 ### Docker / 公网部署
 
