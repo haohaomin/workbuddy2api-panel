@@ -1,14 +1,14 @@
-# WorkBuddy2API Panel · haohaomin fork
+# WorkBuddy2API Panel++
 
-基于 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 的个人维护分支，重点改进 **macOS 桌面使用、版本更新和服务器部署**。
+基于 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 的个人增强分支：**持续同步上游全部功能更新，并在此基础上扩充个人功能**，包括 macOS 桌面应用、一键更新和服务器部署。
 
-WorkBuddy2API 将 WorkBuddy / CodeBuddy 账号接入自托管网关，提供 OpenAI 与 Anthropic 兼容接口。本仓保留上游的 Web 面板、账号池和协议适配，并同步上游更新。
+WorkBuddy2API 将 WorkBuddy / CodeBuddy 账号接入自托管网关，提供 OpenAI 与 Anthropic 兼容接口。上游的 Web 面板、账号池、协议适配及后续功能与修复持续合入；本仓的个人扩展在同步时保留。构建发布、更新源和项目说明由本仓独立维护。
 
 [下载安装包](https://github.com/haohaomin/workbuddy2api-panel/releases/latest) · [服务器部署](deploy/public-gateway/README.md) · [Docker 网页更新](scripts/docker-updater/README.md) · [反馈问题](https://github.com/haohaomin/workbuddy2api-panel/issues)
 
 ## 与直接上游的区别
 
-以下对比对象是 `misakano7545/workbuddy2api-panel`，不是最早的原始项目。
+以下列出在直接上游 `misakano7545/workbuddy2api-panel` 基础上增加的个人功能。同步上游功能与修复是本仓的维护原则；“同步”不代表两仓的发布流程、版本号和更新源相同。
 
 | 本仓增量 | 具体变化 |
 | --- | --- |
