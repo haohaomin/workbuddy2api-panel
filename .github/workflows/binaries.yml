@@ -192,9 +192,51 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  build-windows-installers:
+    needs: version
+    if: needs.version.outputs.needs_publish == 'true'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wb2api-panel-${{ needs.version.outputs.version }}-windows-*
+          path: release-assets
+          merge-multiple: false
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build per-user installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+          $template = Join-Path $PWD 'scripts\windows\WorkBuddy2API.iss'
+          foreach ($arch in @('amd64', 'arm64')) {
+            $artifact = Get-ChildItem (Join-Path $PWD 'release-assets') -Directory -Recurse |
+              Where-Object { $_.Name -eq "wb2api-panel-$env:VERSION-windows-$arch" } |
+              Select-Object -First 1
+            if (-not $artifact) { throw "Windows $arch artifact directory not found" }
+            $inputDir = (Get-ChildItem $artifact.FullName -Filter 'wb2api.exe' -Recurse | Select-Object -First 1).Directory.FullName
+            if (-not $inputDir) { throw "wb2api.exe not found in $($artifact.FullName)" }
+            & $iscc "/DAppVersion=$env:VERSION" "/DInputDir=$inputDir" "/DOutputDir=$PWD\dist" "/DOutputName=WorkBuddy2API-Setup-windows-$arch" $template
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed for $arch" }
+          }
+          Get-ChildItem dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-panel-${{ env.VERSION }}-windows-installers
+          path: dist/*.exe
+          if-no-files-found: error
+
   release:
     if: (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && needs.version.outputs.needs_publish == 'true'
-    needs: [version, build, build-macos]
+    needs: [version, build, build-macos, build-windows-installers]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
@@ -211,8 +253,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/macos/update-manifest.py "$VERSION" release-assets
-          mapfile -t files < <(find release-assets -type f \( -name '*.zip' -o -name '*.dmg' \) -print | sort)
-          [ "${#files[@]}" -eq 10 ]
+          mapfile -t files < <(find release-assets -type f \( -name '*.zip' -o -name '*.dmg' -o -name '*Setup-windows-*.exe' \) -print | sort)
+          [ "${#files[@]}" -eq 12 ]
           state="$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
           if [ "$state" = false ]; then
             echo "v${VERSION} is already published; leaving its assets unchanged."

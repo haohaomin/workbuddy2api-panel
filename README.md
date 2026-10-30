@@ -59,7 +59,9 @@ Web 管理面板、浏览器登录、多账号调度、模型管理、工具与�
 
 ### Windows / Linux
 
-从 [Releases](https://github.com/haohaomin/workbuddy2api-panel/releases/latest) 下载对应系统和架构的 ZIP，解压后运行。Windows 新安装会把配置、账号和运行数据放在 `%LOCALAPPDATA%\WorkBuddy2API\`；如果当前目录已有 `config.json`，则继续使用当前目录，兼容绿色版和旧部署。
+从 [Releases](https://github.com/haohaomin/workbuddy2api-panel/releases/latest) 下载 Windows 安装包或绿色 ZIP。安装包是 per-user 安装，不需要管理员权限；绿色 ZIP 适合便携运行。Windows 新安装会把配置、账号和运行数据放在 `%LOCALAPPDATA%\WorkBuddy2API\`；如果当前目录已有 `config.json`，则继续使用当前目录，兼容旧部署。
+
+安装包文件名为 `WorkBuddy2API-Setup-windows-amd64.exe` 或 `WorkBuddy2API-Setup-windows-arm64.exe`。安装、升级和卸载不会主动删除 `config.json`、`auths/` 或 `data/`；如需彻底清理，请在确认备份后手动删除 `%LOCALAPPDATA%\WorkBuddy2API\`。
 
 ```powershell
 # Windows
