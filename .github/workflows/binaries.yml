@@ -8,6 +8,9 @@ on:
       - ".github/workflows/autobot.yml"
       - "AutoBot.yml"
       - "scripts/autobot.py"
+  # Run the same test/build gate for pull requests; release jobs remain limited
+  # to main and version tags below.
+  pull_request:
   workflow_dispatch:
   # Fork synchronization can update main without starting a push workflow.
   # This lightweight poller catches such commits and the normal push trigger

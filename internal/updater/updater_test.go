@@ -183,7 +183,7 @@ func TestTrustedGitHubURL(t *testing.T) {
 		initial bool
 		want    bool
 	}{
-		{"https://github.com/misakano7545/workbuddy2api-panel/releases/download/v1/file.zip", true, true},
+			{"https://github.com/haohaomin/workbuddy2api-panel/releases/download/v1/file.zip", true, true},
 		{"https://objects.githubusercontent.com/github-production-release-asset/file.zip", false, true},
 		{"https://release-assets.githubusercontent.com/file.zip", false, true},
 		{"https://github.com.evil.example/file.zip", false, false},
