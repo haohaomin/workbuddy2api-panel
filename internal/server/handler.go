@@ -144,8 +144,48 @@ func (h *Handler) modelAlias(realm, bare string) (string, bool) {
 	if bare == "" {
 		return "", false
 	}
-	target, ok := h.loadLive().ModelAliases[strings.ToLower(realm)+":"+strings.ToLower(bare)]
-	return target, ok
+	aliases := h.loadLive().ModelAliases
+	key := strings.ToLower(realm) + ":" + strings.ToLower(bare)
+	if target, ok := aliases[key]; ok {
+		return target, true
+	}
+	// 精确键没中再看通配键（`claude-*` 这类）。map 无序，命中多个时按模式更长优先、
+	// 同长取字典序，保证 `cn:claude-*` 稳定压过 `*`。
+	bestKey, bestTarget := "", ""
+	for pattern, target := range aliases {
+		if target == "" || !strings.ContainsAny(pattern, "*?") || !wildcardMatch(pattern, key) {
+			continue
+		}
+		if bestKey == "" || len(pattern) > len(bestKey) ||
+			(len(pattern) == len(bestKey) && pattern < bestKey) {
+			bestKey, bestTarget = pattern, target
+		}
+	}
+	return bestTarget, bestKey != ""
+}
+
+// wildcardMatch 大小写不敏感通配：`*` 任意串（含空）、`?` 单字节。
+// 双指针 + 单回溯点，零分配；模型名是 ASCII，够用。
+func wildcardMatch(pattern, s string) bool {
+	p, t := strings.ToLower(pattern), strings.ToLower(s)
+	pi, ti, star, mark := 0, 0, -1, 0
+	for ti < len(t) {
+		switch {
+		case pi < len(p) && (p[pi] == '?' || p[pi] == t[ti]):
+			pi, ti = pi+1, ti+1
+		case pi < len(p) && p[pi] == '*':
+			star, pi, mark = pi, pi+1, ti
+		case star != -1:
+			pi, mark = star+1, mark+1
+			ti = mark
+		default:
+			return false
+		}
+	}
+	for pi < len(p) && p[pi] == '*' {
+		pi++
+	}
+	return pi == len(p)
 }
 
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。
@@ -220,6 +260,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddings))
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
+	// Claude Code 上下文将满时会调官方计数端点，上游没有对应接口，这里本地估算
+	// （见 messages.go:countTokens）。缺这个端点客户端直接报错。
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAnthropicAuth(h.countTokens))
+	h.mux.HandleFunc("POST /messages/count_tokens", h.withAnthropicAuth(h.countTokens))
 	// 官方 agenttool 联网检索/抓页的网关透传（非对话端点，与 images 同套取号/失败处置）。
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
 	// DeepSeek Fetch API 形状（DSH 的 web-deepseek-api 把 /search 与 /fetch 指向同一 base）。
@@ -897,7 +941,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if m == nil {
 			return ""
 		}
-		to := m[curModel]
+		// 键查找：先试当前域前缀键（"cn:x"/"global:x"，只在该域生效），再回退裸名键
+		// （两域共用）。配置端原样透传不做归一化（与 models.aliases 不同），带前缀的
+		// 键必须由查找端解析 —— 只查裸名会让前缀键整表失效，而 Config.ModelFallback
+		// 的注释与面板都承诺「裸名或带域前缀均可」（2026-10-25 实案：config.json 写
+		// {"global:deepseek-v4.1-flash": "..."}，global 域 6004 后完全没有降级）。
+		to := m[realm+":"+curModel]
+		if to == "" {
+			to = m[curModel]
+		}
 		if to == "" || to == curModel || fallbackTried[to] || !h.allowedModel(realm, to) || h.hiddenModel(realm, to) {
 			return ""
 		}
@@ -938,6 +990,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+		// request_id 也要同步：此前只有 images 路径设过，chat 行因此永远缺
+		// `rid= | out= | try= | credit= ` 这一段 —— 上游末帧 usage.credit（本次真实
+		// 扣费）与付费/免费判断在流水里完全看不到，只能翻归档对 rid。
+		st.requestID = tr.id
 	}
 	defer st.done()
 
@@ -1502,6 +1558,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+				// 6020 带 data.retry_after（实测 40s、position 2502）时不再换号：上游已给出
+				// 「N 秒后重试」的通道级口径，在这几毫秒内换号必然撞同一堵墙，只是把同一份
+				// 排队请求多发几次（issue #125；embeddings 链路早已同口径 fail-fast）。
+				// 6021（队列满、无 retry_after）保留轮转：那是间歇空窗，换号有机会碰上。
+				if uerr.RetryAfter > 0 {
+					break
+				}
 				if !rotateBackoff(i, r.Context()) {
 					break // ctx 取消：终止轮转（排队满载换号退避）
 				}
@@ -2411,6 +2474,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 账号临时出池（NoteFailures 达阈降权），单次/偶发不罚（不误伤）。ErrNone
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		if kind == upstream.ErrClient {
+			// 15021 = edgebrowser 的**域名路由策略**拒绝（"domain rejected by via
+			// routing policy"）：域名级判定，同一域名的所有账号返回完全一致的 403，
+			// 与账号健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个
+			// 降到出池（5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
+			// 零动作（/v1/fetch 另有跨域兜底，见 fetch.go）。
+			if upstream.HasCodeMarker(body, "15021") {
+				return
+			}
 			h.cfg.Pool.NoteFailures(uid)
 		}
 	}

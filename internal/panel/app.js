@@ -370,18 +370,15 @@ function disabledAge(at) {
   return Math.floor(sec / 86400) + ' 天前';
 }
 
-function rateLimitRowsHtml(rows, now) {
+function rateLimitRowsHtml(rows, now, realm) {
   const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
   if (!list.length) return '';
   // 降级路由表（overview 的 model_fallback）：限流的模型若配了等价模型，标注
   // 「⤳ 已路由至 X」—— 否则用户看到「v4.1 限流」会以为服务断了，实际请求已被
   // 自动改道到等价模型继续服务。这条是用户实测反馈要求可见的。
-  const fb = (overviewData && overviewData.model_fallback) || {};
   return '<div class="rate-limits">' + list.map(row => {
     const m = rateLimitMeta(row, now);
-    // 双重查找：上游台账里的 model 可能带 realm 前缀（cn:x），配置里是裸名。
-    const bare = String(m.model || '').replace(/^[a-z]+:/, '');
-    const alt = fb[row.model] || fb[bare] || '';
+    const alt = fallbackTargetFor(m.model, realm);
     const route = alt ? '<span class="fb">⤳ 已路由至 ' + esc(alt) + '</span>' : '';
     const title = alt ? m.title + '；已自动改道到 ' + alt : m.title;
     return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
@@ -559,7 +556,7 @@ function renderAccounts(list) {
         (dk && dk.action ? '<span>' + esc(dk.action) + '</span>' : '') +
         '<div style="margin-top:2px;opacity:.85">' + esc(s.reason) + '</div></div>'
       : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now(), s.realm);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -642,6 +639,17 @@ function renderAccounts(list) {
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。后端已按
 // 「整池不可用 → 此刻没号 → 部分限流」排好序，这里只做展示（移植上游 PR #120）。
 const ML_STATE = { locked: ['bad', '全池锁定'], starved: ['warn', '此刻无号'], partial: ['ok', '部分限流'] };
+/* fallbackTargetFor 查该 (域, 模型) 配置的降级目标（未配置 → 空串）。
+   配置键既可能是裸名，也可能带 cn:/global: 前缀，查找顺序必须与网关侧
+   lookupFallback 一致：带域前缀的键优先，再回退裸名——只查裸名会让按域
+   配置的键整表失效，限流的模型看不到「已路由至」。限流行（rateLimitRowsHtml）
+   与锁池表（renderModelLocks）共用；函数声明提升，两处调用均可用。 */
+function fallbackTargetFor(model, realm) {
+  if (!model) return '';
+  const bare = String(model).replace(/^[a-z]+:/, '');
+  const t = (overviewData && overviewData.model_fallback) || {};
+  return (realm ? t[realm + ':' + bare] : '') || t[model] || t[bare] || '';
+}
 function renderModelLocks(rows) {
   const tb = $('mlBody');
   const list = Array.isArray(rows) ? rows : [];
@@ -654,8 +662,14 @@ function renderModelLocks(rows) {
     const [cls, label] = ML_STATE[r.state] || ['', r.state || '—'];
     const unlock = r.unlock_at && !/^0001-/.test(r.unlock_at) ? fmtLocalDateTime(r.unlock_at) : '—';
     const fully = r.fully_unlock_at && !/^0001-/.test(r.fully_unlock_at) ? fmtLocalDateTime(r.fully_unlock_at) : '—';
+    // 「锁了但请求照样能过」是这张表最容易误读的地方：配了降级路由表时，该模型
+    // 在本域不可用，请求已被网关改道到等价模型继续服务。不标出来，会把
+    // 「global flash 锁定」直接读成「flash 服务中断」。
+    const alt = fallbackTargetFor(r.model, r.realm);
+    const route = alt ? '<div class="fb" title="该模型在本域不可用时，请求已自动改道到 ' +
+      esc(alt) + '">⤳ 已路由至 ' + esc(alt) + '</div>' : '';
     return '<tr>' +
-      '<td><b>' + esc(r.model) + '</b></td>' +
+      '<td><b>' + esc(r.model) + '</b>' + route + '</td>' +
       '<td>' + (r.realm === 'global' ? '国际版' : '国内版') + '</td>' +
       '<td><span class="tag ' + cls + '">' + label + '</span></td>' +
       '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
@@ -1346,18 +1360,18 @@ $('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
-// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSinceTs 是下次增量的起点。
+// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSeq 是下次增量的起点。
 // 常态每 5 秒只传新增行，不再每轮重拉 500 行（~90KB）并重建整块 DOM。
 // LOG_ROWS_MAX 与服务端环形缓冲同量级（500）——本地窗口不必更大。
 let logRows = [];
-let logSinceTs = null;
-let logSince = '';
+let logSeq = 0;
+let logCursorAt = null;
 const LOG_ROWS_MAX = 500;
 // 增量游标最长有效期：超过则改全量拉（服务端环形缓冲只有 500 行，久了会淘汰
 // 中间旧行，增量就拿不到「完整的一段」）。
 const LOG_CURSOR_MAX_AGE_MS = 5 * 60 * 1000;
 // resetLogWindow 丢弃本地窗口，下次改为全量拉（切视图/手动重载时用）。
-function resetLogWindow() { logRows = []; logSinceTs = null; logSince = ''; }
+function resetLogWindow() { logRows = []; logSeq = 0; logCursorAt = null; }
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1395,10 +1409,10 @@ async function loadLogs() {
     // 例外：切走很久再回来时，服务端环形缓冲（500 行）可能已经把中间的旧行
     // 淘汰掉了——增量只会拿到「还在环里」的那部分，中间缺一段。因此游标超过
     // LOG_CURSOR_MAX_AGE_MS 就退回全量拉（一次 90KB，换来不缺行）。
-    if (logSinceTs && (Date.now() - logSinceTs.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
+    if (logCursorAt && (Date.now() - logCursorAt.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
       resetLogWindow();
     }
-    const lq = logSince ? '?since=' + encodeURIComponent(logSince) : '';
+    const lq = logSeq ? '?since_seq=' + logSeq : '';
     const [d, requestRows, credit, errSum] = await Promise.all([
       api('logs' + lq),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
@@ -1417,19 +1431,29 @@ async function loadLogs() {
     renderRequestMetrics(metrics, recent);
     // 增量合并到本地窗口（增量拉到的行 append；全量拉到的行 replace）。
     const incoming = d.entries || [];
-    if (logSince) {
+    if (logSeq) {
       logRows = logRows.concat(incoming);
       if (logRows.length > LOG_ROWS_MAX) logRows = logRows.slice(-LOG_ROWS_MAX);
     } else {
       logRows = incoming.slice(-LOG_ROWS_MAX);
     }
-    // 下次增量的起点：本次收到的最后一条的时间戳（同毫秒的多条会被一起带上，
-    // 重复无害——服务端按 After(since) 过滤，同毫秒条目可能重复一次；用
-    // 「已见过的最大 ts」而不是「现在」是对的：不能漏）。
+    // 下次增量的起点：**服务端给的单调节号 seq**，不是时间戳。
+    //
+    // 时间戳在这里靠不住：入环 TS 是 time.Now()，同一时钟刻度内的多次写入完全相同
+    // （Windows 实测 ~15.6ms 粒度，一次 Write 的多行、背靠背的 Write 都会撞）。
+    // 按「最后一条的 ts」推进游标时，同一刻度里排在它后面（或就是它自己）的行
+    // 永远满足「晚于 since」，于是每轮轮询都重复返回一次、游标再也不前进——
+    // 面板「运行日志」底部那行反复刷出来。JS 的 Date 还只有毫秒，把原始串换成
+    // Date 往返只会让重复更严重。
+    // seq 是环内单调递增的（淘汰不回退），`seq > logSeq` 精确表达「还有哪些没给过」。
     for (const e of incoming) {
-      if (e && e.ts && (!logSinceTs || new Date(e.ts) > logSinceTs)) logSinceTs = new Date(e.ts);
+      if (e && typeof e.seq === 'number' && e.seq > logSeq) logSeq = e.seq;
     }
-    logSince = logSinceTs ? logSinceTs.toISOString() : '';
+    // logCursorAt 记的是「上次成功同步的时刻」，不是「上次出现新行的时刻」：
+    // 老化判断要回答的是「我离开多久没跟了」，与有没有新日志无关。空闲时也刷新，
+    // 否则静默期每 5 分钟就会误触发一次全量拉（90KB 白拉）。真正切走很久再回来时
+    // 轮询本来就停了，这里的值会自然变旧，届时照旧回落全量。
+    logCursorAt = new Date();
     const entries = logRows.filter(e => logCh === 'all' || e.ch === logCh);
     setHTML(box, entries.length
       ? entries.map(e => {
@@ -1743,6 +1767,8 @@ const CFG_MAP = {
   models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
   thinking_enabled: ['thinking', 'enabled'],
+  cn_chat_base: ['cn', 'chat_base'], cn_billing_base: ['cn', 'billing_base'],
+  global_chat_base: ['global', 'chat_base'], global_billing_base: ['global', 'billing_base'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1755,7 +1781,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1871,6 +1897,28 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
+// cfgRealmFilter 配置页分域切换：all 显示全部；cn/global 仅显示该域专属字段
+// （data-realm 标记）。共享配置（无 data-realm）始终显示。保存时仍回传整份配置，
+// 故切换仅控制可见性、不丢字段。域名 base 等各域独立配置由此分开关，与账号池
+// 已有的 accRealmTabs 同构。
+let cfgRealmFilter = 'all';
+function applyCfgRealmFilter() {
+  document.querySelectorAll('#cfgForm [data-realm]').forEach(el => {
+    const r = el.getAttribute('data-realm');
+    el.style.display = (cfgRealmFilter === 'all' || cfgRealmFilter === r) ? '' : 'none';
+  });
+  const tabs = $('cfgRealmTabs');
+  if (tabs) tabs.querySelectorAll('button[data-realm]').forEach(b => b.classList.toggle('on', b.dataset.realm === cfgRealmFilter));
+}
+if ($('cfgRealmTabs')) {
+  $('cfgRealmTabs').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-realm]');
+    if (!btn) return;
+    cfgRealmFilter = btn.dataset.realm;
+    applyCfgRealmFilter();
+  });
+  applyCfgRealmFilter();
+}
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -3775,6 +3823,9 @@ function renderExpirySnapshot(d) {
   }
   const dayTotals = [...dayMap.values()].sort((x, y) =>
     (x.date < y.date ? -1 : x.date > y.date ? 1 : 0) || (x.realm < y.realm ? -1 : 1));
+  if ($('expTotalNote')) {
+    $('expTotalNote').textContent = dayTotals.length ? dayTotals.length + ' 个到期日' : '暂无';
+  }
   $('expTotalBody').innerHTML = dayTotals.map(t => {
     const days = expDayDiff(t.date);
     return '<tr><td>' + esc(t.date) +
@@ -5050,7 +5101,10 @@ function renderEventTable() {
     const acctRaw = e.account || '-';
     const acctClean = acctRaw.replace(/\([^)]*\)/, '');
     const mName = e.model || '-';
-    const effort = e.reasoning_effort || '-';
+    const effort = e.reasoning_effort || '';
+    // 旧归档行没有这个键（不知道客户端发了什么）；新行恒有（空串 = 确认没发）。
+    const hasEffortReq = 'reasoning_effort_requested' in e;
+    const effortReq = e.reasoning_effort_requested || '';
 
     let resTag = '<span class="tag-badge tag-success">成功</span>';
     if (e.status === 429) {
@@ -5089,7 +5143,7 @@ function renderEventTable() {
       '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
       '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
       '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
-      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
+      '<td>' + eventEffortPill(effort, effortReq, hasEffortReq) + '</td>' +
       '<td>' + resTag + '</td>' +
       '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
       '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
@@ -5103,6 +5157,21 @@ function renderEventTable() {
   }).join('');
 
   setHTML(tb, html);
+}
+
+// eventEffortPill 事件页「推理强度」列：「客户端要的」→「网关实际发出去的」两段显示。
+// 网关会在客户端没带档位时补模型默认档（thinking 默认档）、按策略改写或就近降级；
+// 只显示生效值时整列都是 max，看不出这一档是谁定的（与聊天行日志的
+// effort=max->high / effort=- ->max 同一口径）。
+//   - 一致：max；不一致（改写/降级）：high→max；客户端没发（网关补默认档）：-→max；都没有：-
+//   - hasReq=false 是升级前的老归档行（没有这个键），按旧口径只显示生效值，不臆测。
+function eventEffortPill(eff, req, hasReq) {
+  if (!hasReq) return '<span class="pill-effort">' + esc(eff || '-') + '</span>';
+  if (!eff && !req) return '<span class="pill-effort">-</span>';
+  if (!req) return '<span class="pill-effort" title="客户端未携带思考档位，这是网关补的默认档">-→' + esc(eff) + '</span>';
+  if (!eff) return '<span class="pill-effort" title="客户端要求关闭思考，或该档位模型不支持">' + esc(req) + '</span>';
+  if (req === eff) return '<span class="pill-effort">' + esc(eff) + '</span>';
+  return '<span class="pill-effort" title="左：客户端请求；右：网关实际发送">' + esc(req) + '→' + esc(eff) + '</span>';
 }
 
 // renderEventContext 把一次请求的会话上下文渲染成「角色 + 原文」块。

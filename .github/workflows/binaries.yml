@@ -67,6 +67,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Official head parity
+        run: WB2A_PARITY=1 go test ./internal/upstream -run TestOfficialParity -v
+
       - name: Test
         run: |
           python3 tests/test-release-version.py
