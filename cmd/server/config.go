@@ -357,9 +357,10 @@ type Config struct {
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
 		// 关闭后完全不使用到期信息选号。
 		PreferExpiring bool `json:"prefer_expiring"`
-		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的批次令账号命中上述 ×3 加权；窗口开大 → 命中账号变多、
+		// ExpiringSoon 快过期积分窗口（如 "720h"=30天）：签到/余额刷新时，到期时间在
+		// 此窗口内的批次令账号命中上述加权；窗口开大 → 命中账号变多、
 		// 偏好被稀释。空/0 = 禁用该加权门槛。
+		// 窗口外的批次完全不参与：账号最早批次在窗口外时即使它最近到期也不加权。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -377,6 +378,10 @@ type Config struct {
 		// 被用到 0。未配置（键缺席）→ 默认 10；显式写 0 = 关闭；从未查到余额的账号不受影响。
 		// 指针类型用于区分「未配置」（nil → 默认 10）与「显式 0」（关闭）。
 		ReserveCredits *int64 `json:"reserve_credits"`
+		// ReserveCreditsByRealm 按域覆盖上面的阈值（issue #147）：键 "cn"/"global"，
+		// 值为该域阈值（0 = 该域关闭）。场景是国内版留 1000 分养号、国际版只留 350
+		// 分接低流量模型——两域共用一个数值时只能取更严的那个。未写的域用全局值。
+		ReserveCreditsByRealm map[string]int64 `json:"reserve_credits_by_realm"`
 		// AccountPriority / AccountShare 账号级路由偏好（issue #62）。键 = uid（面板账号
 		// 行的短 uid，悬停看完整值）。缺省/空表 = 全部未配置，选号行为与旧版完全一致。
 		//   account_priority: {"<uid>": 1} 小 = 先消耗。配了的号构成「先烧层」，层内号
@@ -548,7 +553,11 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.PreferExpiring = true
-	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 快过期窗口默认 30 天。7 天太窄：奖励积分的批次到期日普遍排在 2～4 周后，
+	// 窗口内常常一个号都不命中，加权形同未开（实测三号池最早批次 22/25/27 天后，
+	// credits_expiring 全 0，选号退化成普通加权）。窗口内是相对紧迫度，放宽不会
+	// 让紧迫度失真，只是把「今天到期 vs 四周后到期」也纳入同一条曲线。
+	c.Pool.ExpiringSoon = "720h"
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
 	// 窗口用量调度默认 1h（issue #112：热点号降权，把流量摊给闲置号）；"0" 关停。
@@ -1029,6 +1038,17 @@ func (c *Config) normalize() error {
 		c.Pool.ReserveCredits = &v
 	case *c.Pool.ReserveCredits < 0:
 		*c.Pool.ReserveCredits = 0
+	}
+	// 保留积分按域覆盖（issue #147）：非法键剔除，负值归零（0 = 该域关闭）。
+	// 未写的域回落 reserve_credits。删除时不能边遍历边 delete 之外还改值——先收集再改。
+	for k, v := range c.Pool.ReserveCreditsByRealm {
+		if k != "cn" && k != "global" {
+			delete(c.Pool.ReserveCreditsByRealm, k)
+			continue
+		}
+		if v < 0 {
+			c.Pool.ReserveCreditsByRealm[k] = 0
+		}
 	}
 	// 账号优先级/占比（issue #62）：非正值视为「未配置」直接剔除——0 在这里不是有意义的
 	// 配置（不是"最低优先级"，也不是"零占比"），留着会让语义有两种解释。剔除后空表与

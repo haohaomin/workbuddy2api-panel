@@ -183,7 +183,7 @@ func TestTrustedGitHubURL(t *testing.T) {
 		initial bool
 		want    bool
 	}{
-			{"https://github.com/haohaomin/workbuddy2api-panel/releases/download/v1/file.zip", true, true},
+		{"https://github.com/haohaomin/workbuddy2api-panel/releases/download/v1/file.zip", true, true},
 		{"https://objects.githubusercontent.com/github-production-release-asset/file.zip", false, true},
 		{"https://release-assets.githubusercontent.com/file.zip", false, true},
 		{"https://github.com.evil.example/file.zip", false, false},
@@ -347,5 +347,68 @@ func TestDeploymentCapabilities(t *testing.T) {
 	auto, _ := m.scheduleDue(time.Date(2026, 10, 23, 20, 0, 0, 0, time.UTC))
 	if auto {
 		t.Fatal("unsupported deployment ran automatic install schedule")
+	}
+}
+
+func TestCheckCurrentVersionComparability(t *testing.T) {
+	const latest = "2026.11.1.905"
+	const releaseURL = "https://github.com/example/project/releases/tag/v" + latest
+	tests := []struct {
+		version   string
+		known     bool
+		available bool
+	}{
+		{"dev", false, false},
+		{"vdev", false, false},
+		{"", false, false},
+		{"v1.2.3", false, false},
+		{"v2026.11.3", false, false},
+		{"2026.11.1.0905", false, false},
+		{"2026.10.31.845", true, true},
+		{latest, true, false},
+		{"2026.11.2.2117", true, false},
+		{"v2026.11.2.2117", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.version, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/update.json") {
+					http.NotFound(w, r)
+					return
+				}
+				if strings.HasPrefix(r.URL.Path, "/failure/") {
+					http.Error(w, "rate limited", http.StatusForbidden)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"tag_name":"v%s","html_url":"%s","body":"notes"}`, latest, releaseURL)
+			}))
+			defer server.Close()
+			m := New(tt.version, "example/project", "", Settings{})
+			m.apiBaseURL, m.manifestBaseURL = server.URL, server.URL
+			initial := m.Status()
+			if initial.CurrentVersion != tt.version || initial.CurrentKnown != tt.known || initial.UpdateAvailable {
+				t.Fatalf("unexpected initial status: %+v", initial)
+			}
+			if err := m.Check(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := m.Status()
+			if got.CurrentKnown != tt.known || got.UpdateAvailable != tt.available ||
+				got.LatestVersion != latest || got.ReleaseURL != releaseURL || got.ReleaseNotes != "notes" {
+				t.Fatalf("unexpected checked status: %+v", got)
+			}
+			if !tt.known && got.CanInstall {
+				t.Fatal("unknown versions must not allow in-place installation")
+			}
+			m.apiBaseURL = server.URL + "/failure"
+			if err := m.Check(context.Background()); err == nil {
+				t.Fatal("expected API error")
+			}
+			got = m.Status()
+			if got.CurrentKnown != tt.known || got.UpdateAvailable != tt.available ||
+				got.LatestVersion != latest || got.ReleaseURL != releaseURL || got.LastError == "" {
+				t.Fatalf("API error must preserve the version state: %+v", got)
+			}
+		})
 	}
 }
