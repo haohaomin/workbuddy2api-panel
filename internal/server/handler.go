@@ -114,6 +114,10 @@ type Config struct {
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
+
+	// WatermarkStripEnabled 实验特性「水印裁切」开关的静态回退
+	// （features.watermark_strip_enabled，默认关闭）。同上：Live 非 nil 时以热快照为准。
+	WatermarkStripEnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -124,15 +128,16 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	// 白名单静态回退（issue #68）：裸用/单测路径不依赖 Live，与 Hidden 对称。
 	allowed, enabled := livecfg.NormalizeAllowedModels(h.cfg.ModelsAllowed)
 	return livecfg.Snapshot{
-		APIKey:            h.cfg.APIKey,
-		SoftCooldown:      h.cfg.SoftCooldown,
-		EmbeddingsEnabled: h.cfg.EmbeddingsEnabled,
-		RecordClientInfo:  h.cfg.RecordClientInfo,
-		RecordContext:     h.cfg.RecordContext,
-		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
-		AllowedModels:     allowed,
-		AllowlistEnabled:  enabled,
-		ModelAliases:      livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
+		APIKey:                h.cfg.APIKey,
+		SoftCooldown:          h.cfg.SoftCooldown,
+		EmbeddingsEnabled:     h.cfg.EmbeddingsEnabled,
+		WatermarkStripEnabled: h.cfg.WatermarkStripEnabled,
+		RecordClientInfo:      h.cfg.RecordClientInfo,
+		RecordContext:         h.cfg.RecordContext,
+		HiddenModels:          livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		AllowedModels:         allowed,
+		AllowlistEnabled:      enabled,
+		ModelAliases:          livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
 	}
 }
 
@@ -225,7 +230,12 @@ type Handler struct {
 	wafIP       wafIPGate
 	taskMu      sync.Mutex
 	taskRunning map[string]bool
-	budget      *dailyBudget
+	// videos 视频任务台账：上游任务只对提交它的账号可见，查询必须回到同一账号；
+	// 进程内（重启清空，查询时有界探测自愈），见 videos.go 文件头。
+	videoLedger *videoTaskStore
+	// videoProbe 台账里没有的任务的探测状态（负缓存 / 全局限速 / 暂停），见 videos_probe.go。
+	videoProbe videoProber
+	budget     *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -246,6 +256,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg:         cfg,
 		mux:         http.NewServeMux(),
 		taskRunning: map[string]bool{},
+		videoLedger: newVideoTaskStore(),
 		budget:      newDailyBudget(cfg.BudgetLimit),
 	}
 	h.budget.setGuards(cfg.BurstCreditLimit, cfg.CacheLowRate)
@@ -256,8 +267,22 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/responses", h.withAuth(h.responsesWebsocketUnsupported))
 	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(func(w http.ResponseWriter, r *http.Request) { h.images(w, r, false) }))
 	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(func(w http.ResponseWriter, r *http.Request) { h.images(w, r, true) }))
+	// 视频生成：上游 /v2/videos/* 是异步任务，网关拆成「提交 / 查任务」两个入口
+	// （同步等待由 wait / timeout_seconds 控制），见 videos.go 文件头。
+	// POST /v1/videos 与 GET /v1/videos/{id}/content 是 OpenAI Videos 资源的标准路径，
+	// 与下面三条自解释路径共用同一份实现（OpenAI 那套已于 2026-09-24 关停，形状仍在 SDK 里）。
+	h.mux.HandleFunc("POST /v1/videos", h.withAuth(h.videos))
+	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videos))
+	h.mux.HandleFunc("POST /v1/videos/tasks", h.withAuth(h.videoTasks))
+	h.mux.HandleFunc("GET /v1/videos/{task_id}/content", h.withAuth(h.videoContent))
+	h.mux.HandleFunc("GET /v1/videos/{task_id}", h.withAuth(h.videoTask))
+	// MCP（Streamable HTTP 子集，JSON-RPC 2.0）：把本网关的媒体能力做成工具面，见 mcp.go。
+	h.mux.HandleFunc("POST /mcp", h.withAuth(h.mcpPost))
+	h.mux.HandleFunc("GET /mcp", h.mcpMethodNotAllowed)
 	// 实验特性：OpenAI 兼容嵌入（features.embeddings_enabled，默认关闭；关着时回 403）。
 	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddings))
+	// 实验特性：水印裁切（features.watermark_strip_enabled，默认关闭；关着时回 403）。
+	h.mux.HandleFunc("POST /v1/images/strip-watermark", h.withAuth(h.watermarkStrip))
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	// Claude Code 上下文将满时会调官方计数端点，上游没有对应接口，这里本地估算
@@ -297,7 +322,8 @@ func NewHandler(cfg Config) *Handler {
 func isChatEntry(path string) bool {
 	switch path {
 	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/messages",
-		"/v1/images/generations", "/v1/images/edits":
+		"/v1/images/generations", "/v1/images/edits",
+		"/v1/videos/generations", "/v1/videos/tasks":
 		return true
 	}
 	return false
@@ -734,9 +760,10 @@ func (h *Handler) generationModelEntries() []map[string]any {
 	var out []map[string]any
 	for _, realm := range realms {
 		for _, mi := range h.cfg.Upstream.GenerationModels(realm) {
-			// 只列图片：视频没有网关端点（CN 侧无查询路由、视频走连接器），列出来只会
-			// 引诱客户端去调不存在的路由。视频模型照旧不进对话名单（nonChatModel）。
-			if mi.GenerationKind != "image" {
+			// 图片与视频都单列（视频走 /v1/videos/generations）：客户端据此发现可用模型名，
+			// 不会误发对话请求。其它 kind（对话模型）照旧不在这里出现。
+			kind := mi.GenerationKind
+			if kind != "image" && kind != "video" {
 				continue
 			}
 			// 黑名单同样管出图单列：列表里留着它等于告诉客户端「这个能用」。
@@ -748,16 +775,25 @@ func (h *Handler) generationModelEntries() []map[string]any {
 				continue
 			}
 			entry := map[string]any{
-				"id":               realm + ":" + mi.ID,
-				"object":           "model",
-				"created":          1753600000,
-				"owned_by":         "workbuddy",
-				"image_generation": true,
+				"id":       realm + ":" + mi.ID,
+				"object":   "model",
+				"created":  1753600000,
+				"owned_by": "workbuddy",
+			}
+			if kind == "video" {
+				entry["video_generation"] = true
+			} else {
+				entry["image_generation"] = true
 			}
 			entry = applyModelInfoFields(entry, mi)
-			// 出图模型：modalities.output = ["image"]（没有上下文/输出，limit 自然省略）。
-			// 与对话模型同一份函数，保证两处字段形状一致。
-			applyModelsDevShape(entry, mi, nil, true)
+			// 媒体模型没有上下文/输出（limit 自然省略）。modalities.output 按 kind 写：
+			// 图片 ["image"]、视频 ["video"]（共用函数只管看图/出图，视频这里覆盖一次）。
+			applyModelsDevShape(entry, mi, nil, kind == "image")
+			if kind == "video" {
+				if mod, ok := entry["modalities"].(map[string]any); ok {
+					mod["output"] = []string{"video"}
+				}
+			}
 			out = append(out, entry)
 		}
 	}
@@ -846,16 +882,30 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// admitBudget 过积分闸，拒绝时已写出错误响应并返回 false。chatCompletions 与「出图先于
+// 对话」的 Responses 入口共用，两处的拒绝形状必须一致。
+func (h *Handler) admitBudget(w http.ResponseWriter) bool {
+	ok, why := h.budget.admit()
+	if ok {
+		return true
+	}
+	used, limit, _, _ := h.budget.snapshot()
+	code, msg := "daily_budget_exceeded", fmt.Sprintf(
+		"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
+	if why != "" {
+		// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话
+		code, msg = "credit_guard_tripped", why
+	}
+	writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
+	return false
+}
+
+// budgetAdmittedKey 上游入口（/v1/responses 的托管出图）已经过了积分闸：同一请求后面的对话环节不再判。
+// 否则出图入账后累计越过上限，对话一步就会被拒——图扣了钱却交不出去。代价是最多超支一次对话。
+type budgetAdmittedKey struct{}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	if ok, why := h.budget.admit(); !ok {
-		used, limit, _, _ := h.budget.snapshot()
-		code, msg := "daily_budget_exceeded", fmt.Sprintf(
-			"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
-		if why != "" {
-			// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话
-			code, msg = "credit_guard_tripped", why
-		}
-		writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
+	if admitted, _ := r.Context().Value(budgetAdmittedKey{}).(bool); !admitted && !h.admitBudget(w) {
 		return
 	}
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
