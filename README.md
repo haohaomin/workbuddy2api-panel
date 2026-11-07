@@ -76,6 +76,14 @@ chmod +x ./wb2api
 
 首次运行会生成 `config.json` 和随机 `api_key`。打开 `http://127.0.0.1:7863/panel/`，使用该密钥登录并添加账号。也可以显式指定配置文件：`wb2api.exe -config D:\WorkBuddy2API\config.json`。Windows 安装版不需要管理员权限即可更新用户目录中的程序。
 
+### Windows 常驻运行
+
+如需开机启动和异常退出后重启，可用 NSSM / WinSW 管理服务，或使用 Windows 任务计划程序。程序本身没有内置 Windows 服务安装命令。
+
+设置时指定 `wb2api.exe` 的绝对路径，并通过 `-config` 指定已有配置文件。Windows 安装版默认使用当前用户的 `%LOCALAPPDATA%\WorkBuddy2API\`；服务账户可能不同，显式配置路径可以避免误建另一套配置。服务账户需要能够读写配置、账号及数据目录。
+
+任务计划程序需关闭执行时长限制；其失败重启策略不能保证正常退出后重新启动。需要任何退出都重新启动时，使用服务管理器配置重启策略。升级时先停止常驻项，按原部署方式更换程序再启动，检查 `/healthz` 和面板版本，并确认只有一个服务进程占用端口。
+
 ### Docker / 公网部署
 
 WorkBuddy 镜像：
