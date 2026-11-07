@@ -109,11 +109,15 @@ services:
         max-file: "3"
     environment:
       API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN}
+    # 1Panel 只监听宿主 127.0.0.1:33765，容器里用这个别名回源
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "80:80"
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./static:/srv/static:ro
       - caddy-data:/data
       - caddy-config:/config
 
