@@ -55,3 +55,6 @@ server.exe
 # 编译产物（16MB 误提交过一次，20261021）
 /server
 /app.toml
+
+# macOS 目录元数据（Finder 自动生成，任何层级都忽略）
+.DS_Store

@@ -1,0 +1,66 @@
+# 本机私有站点的反代配置模板
+#
+# 用法：
+#   1. 复制为任意 *.caddy 文件（例如 private.caddy），放在本目录
+#   2. 主 Caddyfile 末尾有 `import /etc/caddy/sites/*.caddy`，
+#      放进来的站点块会在 caddy reload 后生效，无需重建容器
+#   3. 本文件仅作参考，真正的私有配置不要提交进仓库
+#      （.gitignore 已忽略 sites/*.caddy，只放行本模板）
+#
+# 约定：
+#   - 宿主机上的服务用 host.docker.internal:<端口> 回源
+#     （compose 里已配置 extra_hosts: host.docker.internal:host-gateway）
+#   - 同一 docker 网络里的容器直接用服务名，例如 new-api:3000
+#   - 证书由 Caddy 自动申请：域名 DNS 指向本机、80 端口可达即可
+#   - 改完执行：
+#       docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile
+
+# ---------- 示例 1：反向代理到宿主机的服务 ----------
+# panel.example.com {
+# 	reverse_proxy host.docker.internal:33765 {
+# 		transport http {
+# 			dial_timeout 5s
+# 			read_timeout 300s
+# 			write_timeout 300s
+# 		}
+# 	}
+#
+# 	header {
+# 		-Server
+# 	}
+#
+# 	log {
+# 		output stdout
+# 		format console
+# 	}
+# }
+
+# ---------- 示例 2：加一层 Basic Auth（密码用 caddy hash-password 生成） ----------
+# admin.example.com {
+# 	basic_auth {
+# 		operator <bcrypt-hash>
+# 	}
+#
+# 	reverse_proxy host.docker.internal:2053
+#
+# 	header {
+# 		-Server
+# 	}
+# }
+
+# ---------- 示例 3：同一 docker 网络内的容器 ----------
+# monitor.example.com {
+# 	reverse_proxy komari:25774
+# }
+
+# ---------- 示例 4：不走 CDN，用 DNS-01 之外的 ACME 方式（禁用 TLS-ALPN） ----------
+# 当域名套了 Cloudflare 橙云时，TLS-ALPN 挑战无法通过，需要禁用：
+# sync.example.com {
+# 	tls {
+# 		issuer acme {
+# 			disable_tlsalpn_challenge
+# 		}
+# 	}
+#
+# 	reverse_proxy host.docker.internal:8792
+# }

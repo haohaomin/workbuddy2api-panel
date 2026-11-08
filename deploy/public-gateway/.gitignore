@@ -5,3 +5,7 @@ newapi-logs/
 *.tar.gz
 *.dump
 .DS_Store
+
+# 本机私有站点配置：只放行模板，其余一律不进仓库
+sites/*.caddy
+!sites/example.caddy

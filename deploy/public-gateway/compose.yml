@@ -117,7 +117,8 @@ services:
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./static:/srv/static:ro
+      # 本机私有站点配置（不随仓库分发）；目录为空时 glob import 不报错
+      - ./sites:/etc/caddy/sites:ro
       - caddy-data:/data
       - caddy-config:/config
 
