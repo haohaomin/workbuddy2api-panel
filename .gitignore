@@ -58,3 +58,6 @@ server.exe
 
 # macOS 目录元数据（Finder 自动生成，任何层级都忽略）
 .DS_Store
+
+# Local build artifacts (local-45/build.sh 的产物，不进仓库)
+/local-45/dist/
