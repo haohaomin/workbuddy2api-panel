@@ -78,7 +78,9 @@ const timers = new Map();
 let timerID = 0;
 let response, fail = false, navigated, opened;
 const ctx = {
-  $: id => { if (!nodes.has(id)) nodes.set(id, {textContent:'', scrollIntoView(){}}); return nodes.get(id); },
+  // 真实 DOM 元素一定有 style：更新通道那行会写 el.style.color，桩里少了它会在
+  // 「字段名写错」之外的时机炸掉，掩盖真正的断言失败。
+  $: id => { if (!nodes.has(id)) nodes.set(id, {textContent:'', style:{}, scrollIntoView(){}}); return nodes.get(id); },
   api: async () => { if(fail) throw Error('offline'); return response; },
   open: (...args) => { opened = args; },
   toast: (...args) => toasts.push(args), confirm: () => true, go: v => { navigated = v; },

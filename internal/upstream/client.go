@@ -1325,35 +1325,46 @@ func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	env, _, err := c.doJSONRaw(req, a)
+	return env.Data, err
+}
+
+// doJSONRaw 同 doJSON，另外把**原始响应体**一并返回。
+//
+// 为什么需要：多数接口是 {code,msg,data} 信封，doJSON 只交 data 就够了；但账号
+// 资料接口 /console/account 在实际环境里出现过两种形态（顶层平铺 uid/nickname 与
+// {code:0,data:{...}} 包装）。平铺形态没有 code 字段，信封解析后 Code=0、Data 为空，
+// 只看 data 会得到一个空对象——调用方必须能拿到原文自己判形态。
+func (c *Client) doJSONRaw(req *http.Request, a *auth.Auth) (apiEnvelope, []byte, error) {
+	var env apiEnvelope
 	resp, err := c.do(req, a, false)
 	if err != nil {
-		return nil, err
+		return env, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return env, nil, fmt.Errorf("read body: %w", err)
 	}
 	// 必须在 Classify / Unmarshal 之前解压：这两步都按文本处理 raw。
 	if raw, err = decodeResponseBody(resp, raw); err != nil {
-		return nil, err
+		return env, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
-	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return env, raw, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
 	}
 	if env.Code != 0 {
 		kind := Classify(resp.StatusCode, env.Msg)
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
 	}
-	return env.Data, nil
+	return env, raw, nil
 }
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
@@ -2787,13 +2798,26 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // deduction=2034-12-24，余额 500 分）。回退 ExpiredTime（仅在包失效后才回填）
 // → CycleEndTime。都缺 → 无到期（保守：不参与「先烧快到期的」排序）。
 func packageEndAt(deductionMS int64, expired, cycleEnd string) (time.Time, bool) {
+	t, _, ok := packageEndAtEx(deductionMS, expired, cycleEnd)
+	return t, ok
+}
+
+// packageEndAtEx 同 packageEndAt，另外回报「是否只能靠 CycleEndTime 推算」。
+//
+// fromCycle=true 表示前两个权威字段都没有，日期是按计量周期末日推的。上游 Bonus
+// Pack 的实测形态里 DeductionEndTime 与 CycleEndTime **完全相同**（2026-11-10 线上
+// 逐行核对，差 0 秒），所以正常情况不会走到这一步；但 CN 侧与历史包可能缺
+// DeductionEndTime，那时日期只是推算——调用方据此打 WARN 并在面板标注，别让运维
+// 把「推算值」当成真实扣费截止。
+func packageEndAtEx(deductionMS int64, expired, cycleEnd string) (time.Time, bool, bool) {
 	if deductionMS > 0 {
-		return time.UnixMilli(deductionMS).In(softRateResetLoc), true
+		return time.UnixMilli(deductionMS).In(softRateResetLoc), false, true
 	}
 	if t, ok := parsePackageEndTime(expired); ok {
-		return t, true
+		return t, false, true
 	}
-	return parsePackageEndTime(cycleEnd)
+	t, ok := parsePackageEndTime(cycleEnd)
+	return t, ok, ok
 }
 
 // ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
@@ -2805,6 +2829,10 @@ type ExpiryBucket struct {
 	Date     string    `json:"date"`
 	ExpireAt time.Time `json:"expires_at,omitempty"`
 	Remain   int64     `json:"remain"`
+	// Estimated 该日额度里至少有一批的到期日是**按计量周期（CycleEndTime）推算**的，
+	// 不是上游给出的真实扣费截止（缺 DeductionEndTime / ExpiredTime 时的回退）。
+	// 面板据此标注「按计量周期推算」，避免运维把推算值当权威日期（issue #200）。
+	Estimated bool `json:"estimated,omitempty"`
 }
 
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
@@ -3147,11 +3175,11 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 需要区分「本次真签到 / 今天早就签过」的调用方用 CheckinReceipt，本函数只保留
+// error 语义给不关心回执的老调用方（调度器 / CLI）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
-	})
+	_, err := c.CheckinReceipt(a)
+	return err
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
