@@ -14,9 +14,9 @@
 // 「马上要动手」，也有大量正常短答（角色扮演闲聊、明确在等用户回话、拒绝回答）。
 // 接正文 = 把正常回答续成一段废话。
 //
-// 所以这里的采用条件是**只认工具调用**：
-//   - 续写段拿到 tool_calls → 采纳（客户端立刻就能继续执行下一步）；
-//   - 续写段只有正文 → 整段丢弃，客户端看到的内容与接线前**一模一样**。
+// 所以这里的采用条件是**只认完整的工具调用**：
+//   - 续写段以完整的 tool_calls 正常收尾 → 采纳（客户端立刻就能继续执行下一步）；
+//   - 其余（只有正文、截断、断流、报错）→ 整段丢弃，客户端看到的内容与接线前**一模一样**。
 //
 // 判据刻意压窄，且误命中的代价只有「多打一次上游」（前缀缓存命中，费用接近 0）：
 //  1. finish=stop、正文非空、零 tool_calls、无 error 帧；
@@ -31,10 +31,13 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"log"
 	"strings"
+	"unicode"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 // toolOnlyMaxBytes 首段正文超过这个长度就不算「一次提前收尾」。
@@ -76,7 +79,73 @@ func toolOnlyLooksFinished(text string) bool {
 		return false
 	}
 	// narrationTailSuspends 对句末标点返回 false；冒号/逗号/未闭合代码块返回 true。
-	return !narrationTailSuspends(s)
+	if narrationTailSuspends(s) {
+		return false
+	}
+	// 「够长 + 句号收尾」在这两档里都会出现，靠最后一句的**意图**区分：
+	//   "我继续检查其他被错误替换的内容，例如 UnityManual.html 链接。"  ← 还没动手
+	//   "任务已全部完成，我来总结一下。"                                ← 真收尾（收尾词优先）
+	// 只看最后一句：前半段叙述里有"接下来"不代表结尾在预告下一步。
+	last := toolOnlyLastSentence(s)
+	if last == "" {
+		return true
+	}
+	for _, m := range toolOnlyClosingMarkers {
+		if strings.Contains(last, m) {
+			return true
+		}
+	}
+	low := strings.ToLower(last)
+	for _, m := range toolOnlyIntentMarkers {
+		if strings.Contains(low, m) {
+			return false
+		}
+	}
+	return true
+}
+
+// toolOnlyIntentMarkers 最后一句里出现这些词，说明模型在说「下一步要动手」而不是收尾。
+// 取自线上漏救样本（第 108/109 轮）与同类句式；**不收**"下面""接着"这类泛词——
+// "下面这些文件都已改好。" 是典型收尾，收进来就会误救。
+var toolOnlyIntentMarkers = []string{
+	"我继续", "接下来", "下一步", "我来", "现在开始", "现在修复", "再检查",
+	"next, i'll", "next i'll", "next i will", "let me", "now i'll", "i'll now",
+}
+
+// toolOnlyClosingMarkers 收尾词：最后一句里出现就一律当「已答完」，压过意图词。
+// 这条是意图词判据的对冲——"我来总结一下" 的意图词是"我来"，但整句是收尾。
+var toolOnlyClosingMarkers = []string{
+	"总结", "已完成", "全部完成", "已经完成", "完毕", "收尾", "到这里",
+}
+
+// toolOnlyLastSentence 取最后一个句末标点之后的那一句（去掉尾部标点）。
+// 只按句末标点切（不按逗号）："检查完了，我继续修下一个" 整句都算最后一句，
+// 切成半句反而会把意图词切走。
+//
+// 半角 . ! ? 只有后面是空白或文本结尾才算句末：文件名（UnityManual.html、check.go）、
+// 版本号（v1.2）、URL 里的点不是句子边界，按它切会把句子从中间截断（"我将开始修改
+// internal/verify/check.go" 会被切成 "go"）。全角 。！？ 任何位置都算句末。
+func toolOnlyLastSentence(s string) string {
+	rs := []rune(strings.TrimRight(s, " \t\r\n"))
+	start, end := 0, len(rs)
+	for i := len(rs) - 1; i >= 0; i-- {
+		if !strings.ContainsRune("。！？!?.", rs[i]) {
+			continue
+		}
+		if rs[i] < 0x80 && i+1 < len(rs) && !unicode.IsSpace(rs[i+1]) {
+			continue
+		}
+		if i == end-1 {
+			end = i // 尾部标点本身不算内容，继续往前找分隔点
+			continue
+		}
+		start = i + 1
+		break
+	}
+	if start >= end {
+		return ""
+	}
+	return string(rs[start:end])
 }
 
 // toolOnlyNudge 安全续写的指令。必须点明「别再用文字解释」——否则模型会再写一段
@@ -106,13 +175,13 @@ func lastMessageIsToolResult(body []byte) bool {
 // tryToolOnlyRescue 安全续写：只采纳工具调用，正文一律丢弃。
 func (r *continueReader) tryToolOnlyRescue() bool {
 	switch {
-	case r.toolOnlyTried, r.narrationTried, r.errSeen, r.toolSeen, r.clientGone(), r.outputCapped():
+	case r.toolOnlyTried, r.narrationTries > 0, r.errSeen, r.toolSeen, r.clientGone(), r.outputCapped():
 		return false
 	case r.finish != "stop":
 		return false
 	case r.text.Len() == 0 || r.text.Len() > toolOnlyMaxBytes:
 		return false
-	case r.seg >= maxContinueSegments-1:
+	case r.atSegmentCap():
 		return false
 	}
 	// 正文里含工具调用标记（DSML / XML 形态）：客户端会自己解析执行，这不是「提前收尾」。
@@ -148,81 +217,145 @@ func (r *continueReader) tryToolOnlyRescue() bool {
 	r.toolOnlyTried = true
 	// 首段的终态帧先存起来：续写段如果只给正文，要原样回放这一份。
 	r.origFinish, r.origTail = r.finish, r.tail
-	rc, status, _, terr := r.up.ChatStreamContext(r.ctx, r.acct, body, r.clientIP, r.meta, nil)
-	if terr != nil || status >= 400 || rc == nil {
-		if rc != nil {
-			rc.Close()
-		}
+	// 异步换段：等待期内客户端只会收到 keepalive（见 openSegmentAsync）。
+	return r.openSegmentAsync(switchToolOnly, body, func(rc io.ReadCloser) {
+		r.seg++
+		r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
+		r.finish, r.tail = "", nil
+		r.toolOnly = true
+		r.toolOnlyFailed = false
+		r.toolCallBuf, r.toolCallNames, r.toolCallArgs = nil, nil, nil
+		r.segCompletion, r.segThink = 0, 0
+		log.Printf("[toolonly] acct=%s model=%s seg=%d 正文只有 %dB 就收尾（末条是工具结果）→ 试续一次，只采纳工具调用",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, r.text.Len())
+	}, func(status int, terr error) {
 		r.origFinish, r.origTail = "", nil
 		log.Printf("WARN: [toolonly] acct=%s seg=%d 续写请求失败（status=%d err=%v）→ 按原样收尾",
 			logfmt.Label(r.acct.UID, r.acct.Nickname), r.seg+1, status, terr)
-		return false
-	}
-	r.seg++
-	r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
-	r.finish, r.tail = "", nil
-	r.toolOnly = true
-	r.segCompletion, r.segThink = 0, 0
-	log.Printf("[toolonly] acct=%s model=%s seg=%d 正文只有 %dB 就收尾（末条是工具结果）→ 试续一次，只采纳工具调用",
-		logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, r.text.Len())
-	return true
+	})
 }
 
-// settleToolOnly 续写段结束时的裁决：拿到工具调用就采纳，否则整段回滚。
+// toolOnlyFrame 「只采纳工具调用」段的全部 data 帧都走这里（frame() 入口改道）。
+//
+// 不变量：裁决前客户端收不到这一段的任何字节（只有保活注释）。此前只在「还没见到工具
+// 分片」时剥正文，工具分片之后的正文/思考直接透传；error 帧与非法 JSON 也原样透传——
+// 客户端于是在首段的完整回答后面看到半截续写或一条错误。
+//   - usage 照常入账（这一段不管采不采纳都是一次真实的上游调用）；
+//   - 带工具分片或 finish_reason 的帧：剥掉正文/思考与 usage 后暂存，等 settleToolOnly 裁决；
+//   - error 帧 / 流内失败帧 / 非法 JSON：记为失败（整段回滚，首段本来就是完整回答）；
+//   - 其余（正文、思考、空帧）：丢弃，不进 r.text / r.reason（否则后续续写前缀会混进
+//     被丢弃的内容），只按需补保活注释。
+func (r *continueReader) toolOnlyFrame(payload string) {
+	var obj map[string]any
+	if json.Unmarshal([]byte(payload), &obj) != nil {
+		r.toolOnlyFailed = true
+		return
+	}
+	if _, hasErr := obj["error"]; hasErr {
+		r.toolOnlyFailed = true
+		return
+	}
+	if _, _, ok := upstream.StreamErrorFrame(obj); ok {
+		r.toolOnlyFailed = true
+		return
+	}
+	if u, ok := obj["usage"].(map[string]any); ok {
+		r.mergeUsage(u)
+		r.noteSegmentUsage(u)
+		delete(obj, "usage")
+	}
+	keep := false
+	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
+		if c, ok := chs[0].(map[string]any); ok {
+			if d, ok := c["delta"].(map[string]any); ok {
+				delete(d, "content")
+				delete(d, "reasoning_content")
+				delete(d, "reasoning")
+				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+					r.captureToolCallDeltas(tcs)
+					keep = true
+				}
+			}
+			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+				r.finish = fr
+				keep = true
+			}
+		}
+	}
+	if !keep {
+		r.maybeKeepalive()
+		return
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		r.toolOnlyFailed = true
+		return
+	}
+	r.toolCallBuf = append(r.toolCallBuf, string(raw))
+}
+
+// settleToolOnly 续写段结束时的裁决：拿到完整的工具调用就采纳，否则整段回滚到首段终态。
 // 返回 true 表示已回滚（调用方继续走正常收尾路径，回放首段的终态帧）。
 //
-// 采纳前还要过一道闸门（2026-11-11）：续写段的工具调用若与「上一次已执行的调用」同名
-// 同参，说明模型只是把刚跑完的那次原样重发——采纳它等于让客户端把同一个写操作再执行
-// 一遍，回合也永远结束不了。为此 toolOnly 段的工具调用帧不再边到边发，而是先攒在
-// toolCallBuf 里，这里判完再决定补发还是整段丢弃（判重复时客户端一个字节都收不到，
-// 与「没有工具调用」的回滚路径完全一致）。
-func (r *continueReader) settleToolOnly() bool {
+// 采纳要同时满足：
+//   - 没有报错帧 / 非法帧；
+//   - 以 [DONE] 正常收尾且 finish 为 tool_calls / stop——length 或断流说明参数可能只写了
+//     一半，拼给客户端就是半截 JSON，而且会在首段的 stop 之外再多出一个终态；
+//   - 每个调用都有名字、参数是空或完整的 JSON；
+//   - 不是把上一次已执行的调用原样重发（2026-11-11：同名同参 = 模型只是把刚跑完的那次
+//     重发，采纳等于让客户端把同一个写操作再执行一遍，回合也永远结束不了）。
+func (r *continueReader) settleToolOnly(sawDone bool) bool {
 	if !r.toolOnly {
 		return false
 	}
 	r.toolOnly = false
-	if r.toolSeen {
+	buf := r.toolCallBuf
+	r.toolCallBuf = nil
+	reason := ""
+	switch {
+	case r.toolOnlyFailed:
+		reason = "续写段报错或含非法帧"
+	case len(r.toolCallNames) == 0:
+		reason = "续写段没有工具调用"
+	case !sawDone || (r.finish != "tool_calls" && r.finish != "stop"):
+		reason = "续写段未正常收尾（finish=" + r.finish + "）"
+	case !r.toolCallsComplete():
+		reason = "续写段的工具调用不完整"
+	default:
 		if name, dup := r.duplicatesLastExecutedCall(); dup {
-			r.toolCallBuf = nil
-			r.toolSeen = false
-			r.finish, r.tail = r.origFinish, r.origTail
-			r.origFinish, r.origTail = "", nil
-			log.Printf("[toolonly] acct=%s model=%s seg=%d 续写段要重发上一次的调用（%s）→ 丢弃，按原样收尾",
-				logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, name)
-			return true
+			reason = "续写段要重发上一次的调用（" + name + "）"
 		}
-		// 采纳：把缓存的工具调用帧按原顺序补发，收尾照常（回放本段 tail）。
-		for _, p := range r.toolCallBuf {
-			r.emit(p)
-		}
-		r.toolCallBuf = nil
-		r.origFinish, r.origTail = "", nil
-		log.Printf("[toolonly] acct=%s model=%s seg=%d 续写段拿到工具调用 → 采纳",
-			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg)
-		return false
 	}
-	// 回滚：续写段只有正文（或什么都没有）→ 丢掉，客户端看到的内容与接线前一致。
-	r.finish, r.tail = r.origFinish, r.origTail
+	if reason != "" {
+		r.finish, r.tail = r.origFinish, r.origTail
+		r.origFinish, r.origTail = "", nil
+		log.Printf("[toolonly] acct=%s model=%s seg=%d %s → 丢弃，按原样收尾",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, reason)
+		return true
+	}
+	// 采纳：缓存的工具调用帧（含本段终态帧）按原顺序补发，之后照常收尾。
+	for _, p := range buf {
+		r.emit(p)
+	}
+	r.toolSeen = true
+	r.tail = nil // 终态帧已随 buf 发出
 	r.origFinish, r.origTail = "", nil
-	log.Printf("[toolonly] acct=%s model=%s seg=%d 续写段没有工具调用（正文 %dB）→ 丢弃，按原样收尾",
-		logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, r.text.Len())
-	return true
+	log.Printf("[toolonly] acct=%s model=%s seg=%d 续写段拿到工具调用 → 采纳",
+		logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg)
+	return false
 }
 
-// discardToolOnlyDelta 在「只采纳工具调用」阶段剥掉正文/思考增量：这些字节不给客户端，
-// 也不进本地累积（否则后续续写前缀里会混进被丢弃的内容）。
-// 返回 true 表示该 delta 被改动过，需要重新序列化。
-func discardToolOnlyDelta(d map[string]any) bool {
-	changed := false
-	if s, ok := d["content"].(string); ok && s != "" {
-		delete(d, "content")
-		changed = true
+// toolCallsComplete 续写段里每个工具调用都有名字、参数是空或完整的 JSON。
+func (r *continueReader) toolCallsComplete() bool {
+	for idx, name := range r.toolCallNames {
+		if strings.TrimSpace(name) == "" {
+			return false
+		}
+		if a := strings.TrimSpace(r.toolCallArgs[idx]); a != "" && !json.Valid([]byte(a)) {
+			return false
+		}
 	}
-	if s, ok := d["reasoning_content"].(string); ok && s != "" {
-		delete(d, "reasoning_content")
-		changed = true
-	}
-	return changed
+	return true
 }
 
 // captureToolCallDeltas 累积「只采纳工具调用」段里的工具调用分片：name 与 arguments

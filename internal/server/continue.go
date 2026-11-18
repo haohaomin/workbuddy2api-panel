@@ -12,7 +12,7 @@
 //
 // ponytail: 只续文本/推理段。工具参数被截断（半个 JSON）不续——拼接残缺 JSON 比
 // 不续更糟，且上游管线本就丢弃残缺 tool_calls；命中该形态只记日志（等真实分布
-// 决定要不要做 V2 的「剩余参数改写」）。每请求最多 maxContinueSegments 段。
+// 决定要不要做 V2 的「剩余参数改写」）。段数与累计输出上限见 atSegmentCap / outputCap。
 //
 // 续写段接缝的客户端可见性：思考在正文尚未开始时照常外泄（续着同一个 reasoning
 // item 喂，见 frame()），消掉「续写段纯思考期零事件」的静默——Codex 的 provider
@@ -37,22 +37,30 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
-// maxContinueSegments 单请求最多上游段数（1 段原生 + 最多 7 次续写）。
-// 段数不是主要闸门——真正管住开销的是 continueTotalCap（累计输出 token）；
-// 这里只是防「续写自己也在截断」时无限套娃的硬上限。
+// noLimitContinueSegments 客户端没带输出限额时单请求最多上游段数（1 段原生 + 最多 2 次续写）。
+// 这类请求（Codex 等）每段都能写到上游的单段上限（实测 32000），段数本身就是开销闸门：
+// 3 段 ≈ 3×32000 输出。累计输出上限（outputCap）不管它们——按档位下限算的上限（如 low
+// 档 4096×4=16384）比一段还小，会让「不带限额的长文」一次都续不了。
+const noLimitContinueSegments = 3
+
+// maxContinueSegments 客户端带了限额、但属于可续写例外（见 canContinue）时的段数硬上限
+// （1 段原生 + 最多 7 次续写）。这类请求每段只有几千 token，真正管住开销的是 outputCap；
+// 这里只是防「续写自己也在截断」时无限套娃。
 const maxContinueSegments = 8
 
-// defaultContinueTotalCap 没有档位下限时（客户端未指定档位、也就没算下限）
-// 累计输出 token 的兜底上限。
+// defaultContinueTotalCap 带限额、但限额不可解析且没有档位下限时累计输出 token 的兜底上限。
 const defaultContinueTotalCap = 32768
 
-// continueTotalCapRatio 累计输出上限 = 该轮输出预算下限 × 这个系数。
+// continueTotalCapRatio 带限额续写时的累计输出上限 = 单段有效额度 × 这个系数，
+// 单段有效额度 = max(客户端限额, 档位下限)。
 //
 // 为什么按 token 而不是按段数管：固定 3 段时，低档位（下限 4096）每段只有 ~4096
 // 正文，写到第 3 段就撞上限收工——线上实测 effort=low + max_tokens=1024 写
 // 「3000 字以上」的文档，3 段合计正文 9414 token 处还是半句（finish=length，尾
 // 巴停在「### 5.3 …- 正常请求」）。同样的段数在高档位（下限 8192）够用，说明
 // 该管的是「一共准写多少」，不是「允许问上游几次」。
+// 取客户端限额与下限的较大者：额度 ≥32k 的「长文」请求每段本身就有 32k，只按下限算的
+// 上限（low 档 16384）连一段都装不下，「≥32k 照常续写」就成了空话。
 const continueTotalCapRatio = 4
 
 // continueThinkingShare 思考占「本段输出」的比例达到这个值，就认为这次截断是
@@ -111,15 +119,21 @@ type continueReader struct {
 
 	starvedTried bool // 空截断救援已用（每请求一次；见 tryStarvedRetry）
 
-	// narrationTried 预告式收尾的救援续写已用（每请求一次；见 tryNarrationRetry）。
-	narrationTried bool
+	// narrationTries 预告式收尾的救援续写已用次数（上限 narrationMaxRescues；
+	// 见 tryNarrationRetry）。上限 2 而不是 1：长正文的模型常常连写两段预告
+	// （"我先说明结论，然后我将开始修改…"，再停一次），只给一次机会等于第二段
+	// 又回到客户端手上——issue #245 的真实形态。总量仍由 outputCap 兜底。
+	narrationTries int
+	// narrationTextAt 最近一次救援发出时的正文长度：续写段没写出新正文就不再救。
+	narrationTextAt int
 
 	// toolOnlyTried 安全续写（只采纳工具调用）已用（每请求一次；见 tryToolOnlyRescue）。
 	toolOnlyTried bool
-	// toolOnly 当前段处于「只采纳工具调用」模式：正文/思考增量全部丢弃。
+	// toolOnly 当前段处于「只采纳工具调用」模式：帧全部改道 toolOnlyFrame，裁决前客户端什么都收不到。
 	toolOnly bool
-	// toolCallBuf 只在 toolOnly 段暂存工具调用帧：判为「重发上一次调用」时整段丢弃，
-	// 否则 settleToolOnly 里按原顺序补发（见那里的说明）。
+	// toolOnlyFailed 当前 toolOnly 段出现过 error 帧 / 流内失败帧 / 非法帧（整段回滚）。
+	toolOnlyFailed bool
+	// toolCallBuf toolOnly 段暂存的工具调用帧与终态帧（已剥掉正文/思考/usage），采纳时按序补发。
 	toolCallBuf []string
 	// toolCallNames/toolCallArgs 按 index 累积续写段的工具调用（name 与 arguments 都
 	// 分片到达），用于与请求体历史里上一次执行的调用做同名同参比较。
@@ -130,6 +144,24 @@ type continueReader struct {
 	origTail   []string
 
 	lastClientAt time.Time // 上次客户端可见输出/keepalive 的时刻（静默节流）
+	// emitted 已向下游交出过数据帧。在这之前 StreamHint 的首帧否决窗口还开着，一条注释行就会
+	// 提交 200：之后这次尝试的首帧若是 error 帧，就换不了号、只能「200 + error 帧」收尾。
+	// 所以保活注释只在 emitted 之后补（见 maybeKeepalive）。这之前的等待（例如首段零输出
+	// 时的空截断救援）完全靠首帧心跳（server.head_keepalive）喂活连接：配成 0 时这段等待
+	// 客户端一个字节都收不到。
+	emitted bool
+
+	// segSawDone 当前段是否以 [DONE] 收尾：换段失败时按它决定收尾形态。
+	segSawDone bool
+
+	// pending 在途的换段请求（见 openSegmentAsync）。非 nil 时 Read() 不再读旧段，
+	// 而是轮询它并在等待期间补 keepalive——换段是一次完整的上游 POST，同步等待会让
+	// 客户端在整个 TTFB（3~30s）里零字节，触发流式 idle 超时。
+	pending *pendingSeg
+	// openCtx 换段请求用的 context：客户端请求 context 的子 context，Close 时取消——
+	// 客户端断开后在途请求立即放手，不必等请求 context 结束。
+	openCtx  context.Context
+	stopOpen context.CancelFunc
 
 	// readErr 本段结束时的读错误（nil = 上游 [DONE] 正常收尾）。用于区分「上游
 	// 断流」与「客户端先断开」——两者的 err 都是非 nil，但归因完全不同：后者是
@@ -151,6 +183,17 @@ type continueReader struct {
 	// continueCapped 本请求因累计输出到顶而停止续写（用于日志与终态归因）。
 	continueCapped bool
 
+	// switchable 惰性求值的「本请求能不能关思考」（见 thinkingSwitchable）；0 = 未求值。
+	// clientThinkingOff 客户端请求体自己写了 thinking.type=disabled（同一次解析）。
+	switchable        int8
+	clientThinkingOff bool
+
+	// billed 已结束各段 usage 的纯求和（记账口径）。续写、盲重试、各类救援每段都是一次单独计费的
+	// 上游调用，prompt 也是每段各算一次；客户端看到的 usage（见 mergeUsage）为了不虚报上下文
+	// 占用只取末段 prompt，记到账号 / 用量 / 预算上的必须是这一份。segUsage 当前段的 usage。
+	billed   map[string]any
+	segUsage map[string]any
+
 	done bool
 }
 
@@ -166,6 +209,7 @@ func newContinueReaderWithFloor(ctx context.Context, up *upstream.Client, acct *
 		lastClientAt: time.Now(), budgetFloor: budgetFloor}
 	r.br = bufio.NewReaderSize(rc, 64*1024)
 	r.limitSet, r.limit = bodyOutputLimit(body)
+	r.openCtx, r.stopOpen = context.WithCancel(ctx)
 	return r
 }
 
@@ -218,7 +262,21 @@ func (r *continueReader) Read(p []byte) (int, error) {
 }
 
 // Close 关闭当前段 body（续写切换时已关旧段；abandon 场景由 handler defer 兜底）。
+//
+// 有在途的换段请求时取消它，迟到的响应体由一个短命协程收走关掉：客户端空闲超时断开、
+// StreamHint 写保活失败返回时，正是带着在途请求走到这里。
 func (r *continueReader) Close() error {
+	if r.stopOpen != nil {
+		r.stopOpen()
+	}
+	if ps := r.pending; ps != nil {
+		r.pending = nil
+		go func() {
+			if res := <-ps.ch; res.rc != nil {
+				res.rc.Close()
+			}
+		}()
+	}
 	if r.cur != nil {
 		return r.cur.Close()
 	}
@@ -229,6 +287,11 @@ func (r *continueReader) Close() error {
 // `data: [DONE]` 段结束；`data: <payload>` 帧；其他非空行原样透传；空行吞掉
 // （帧分隔由本层自产 "\n\n"）。
 func (r *continueReader) step() {
+	// 换段请求在途：先轮询它（顺带补 keepalive），拿到之前不读旧段。
+	if r.pending != nil {
+		r.pollPending()
+		return
+	}
 	line, err := r.br.ReadString('\n')
 	trimmed := strings.TrimRight(line, "\r\n")
 	switch {
@@ -255,8 +318,23 @@ func (r *continueReader) step() {
 
 // frame 处理一个 data 帧：解析状态（正文/推理/工具/usage），决定透传、吞掉或入 tail。
 func (r *continueReader) frame(payload string) {
+	// 「只采纳工具调用」段在裁决前一个字节都不给客户端：整段改道，不走下面的常规路径
+	// （常规路径会透传 error 帧、非法 JSON，以及工具分片之后的正文）。
+	if r.toolOnly {
+		r.toolOnlyFrame(payload)
+		return
+	}
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil {
+		// 粘帧（issue #197，见 upstream/sse_frame_split.go）：拆开逐份走本函数，每份都记状态、
+		// 各自成帧。原样透传的话，粘在里面的 error / finish_reason / usage 都记不到，续写层
+		// 会把这一段当成「无 finish 断流」去续写。
+		if parts := upstream.SplitConcatenatedJSON(payload); len(parts) > 1 {
+			for _, p := range parts {
+				r.frame(p)
+			}
+			return
+		}
 		// 非法 JSON：原样透传（不解析状态，防抖）
 		r.emit(payload)
 		return
@@ -291,13 +369,9 @@ func (r *continueReader) frame(payload string) {
 	}
 	deltaNonEmpty := false
 	rebuilt := false
-	bufferedToolFrame := false // 本帧只含工具调用且处于 toolOnly 段：入缓存不下发
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		if c, ok := chs[0].(map[string]any); ok {
 			if d, ok := c["delta"].(map[string]any); ok {
-				if r.toolOnly && !r.toolSeen && discardToolOnlyDelta(d) {
-					rebuilt = true
-				}
 				if s, ok := d["reasoning_content"].(string); ok && s != "" {
 					r.reason.WriteString(s)
 					// 续写段思考的接缝策略（两个子情形）：
@@ -323,12 +397,6 @@ func (r *continueReader) frame(payload string) {
 				if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
 					r.toolSeen = true
 					deltaNonEmpty = true
-					// 「只采纳工具调用」段：先攒着不下发——settleToolOnly 要拿它跟历史上
-					// 上一次执行过的调用比对，判为重发就整段丢弃（见那里的说明）。
-					if r.toolOnly {
-						r.captureToolCallDeltas(tcs)
-						bufferedToolFrame = true
-					}
 				}
 			}
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
@@ -359,10 +427,6 @@ func (r *continueReader) frame(payload string) {
 	}
 	if hasUsage && !deltaNonEmpty {
 		return // 纯 usage 帧（已入账）：不再下发
-	}
-	if bufferedToolFrame {
-		r.toolCallBuf = append(r.toolCallBuf, payload)
-		return
 	}
 	r.emit(payload)
 }
@@ -402,38 +466,69 @@ func (r *continueReader) starvedByThinking() bool {
 	return r.segThink >= continueThinkingShare*r.segCompletion
 }
 
-// budgetWasRaised 客户端原本给的额度是否低于本轮下限（即网关抬过额度）。
+// budgetWasRaised 网关是否在出站时把客户端额度抬到过下限（即真正生效的上限是网关选的数）。
 //
 // 用途：抬过额度时，真正生效的上限是网关选的数，不是客户端意图——被它切断就该续写，
 // 否则只是把断点从客户端的 1024 挪到 8192，长回答照样停在半句。
+//
+// 必须与出站抬额度（upstream.ensureMinOutputBudget）同口径：探活级额度（< minStarvedBudget）
+// 与客户端自己关了思考的请求出站时不会被抬，这里也不能当成「抬过」——下限只按生效档位算，
+// 看不到这两条，单比大小会把「客户端关思考、只要 2048」误判成网关的上限。
 func (r *continueReader) budgetWasRaised() bool {
-	if r.budgetFloor <= 0 {
+	if r.budgetFloor <= 0 || r.limit < minStarvedBudget || r.limit >= r.budgetFloor {
 		return false
 	}
-	v, ok := clientOutputBudget(r.body)
-	return ok && v > 0 && v < r.budgetFloor
+	r.parseThinking()
+	return !r.clientThinkingOff
 }
 
-// clientOutputBudget 读客户端原始请求体里的输出额度（三个别名）。
-func clientOutputBudget(body []byte) (int64, bool) {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) != nil {
-		return 0, false
+// thinkingSwitchable 本请求的思考关不关得掉：客户端自己带了 thinking 对象（上游认它的开关），
+// 或模型在「可关思考」名单里（与 continuationBodyWithNudge / starvedRetryBody 同口径）。
+func (r *continueReader) thinkingSwitchable() bool {
+	r.parseThinking()
+	return r.switchable > 0
+}
+
+// parseThinking 从客户端请求体取思考相关的两件事；只在带限额续写的判定里用到，解析一次。
+func (r *continueReader) parseThinking() {
+	if r.switchable != 0 {
+		return
 	}
-	for _, k := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-		switch v := obj[k].(type) {
-		case float64:
-			return int64(v), true
-		case int:
-			return int64(v), true
-		case int64:
-			return v, true
-		}
+	r.switchable = -1
+	var obj struct {
+		Model    string         `json:"model"`
+		Thinking map[string]any `json:"thinking"`
 	}
-	return 0, false
+	if json.Unmarshal(r.body, &obj) != nil {
+		return
+	}
+	if obj.Thinking != nil || upstream.ThinkingSwitchSupported(obj.Model) {
+		r.switchable = 1
+	}
+	t, _ := obj.Thinking["type"].(string)
+	r.clientThinkingOff = strings.EqualFold(strings.TrimSpace(t), "disabled")
+}
+
+// billedUsage 本请求各段 usage 的纯求和（记账口径，见 billed 字段），含还没结束的当前段；
+// 没有任何 usage 时为 nil。
+func (r *continueReader) billedUsage() map[string]any {
+	if r.segUsage == nil {
+		return r.billed
+	}
+	return sumUsage(sumUsage(nil, r.billed), r.segUsage)
+}
+
+// sumUsage 把 u 的数字叶子逐项加进 acc 并返回（acc 为 nil 时新建，不改 u）。
+func sumUsage(acc, u map[string]any) map[string]any {
+	if acc == nil {
+		acc = map[string]any{}
+	}
+	sumInto(acc, u)
+	return acc
 }
 
 func (r *continueReader) emit(payload string) {
+	r.emitted = true
 	r.lastClientAt = time.Now()
 	r.out = append(r.out, "data: "...)
 	r.out = append(r.out, payload...)
@@ -443,13 +538,82 @@ func (r *continueReader) emit(payload string) {
 // maybeKeepalive 被吞帧到达时调用：距上次客户端可见输出超过 keepaliveEvery 就
 // 补一条 SSE 注释帧。注释行（":" 开头）是 SSE 规范的 no-op——StreamHint 原样
 // 透传并 flush，responsesWriter 与 chat 类客户端的解析器都忽略它；唯一作用是
-// 让连接保持「有数据流动」，防流静默超时掐线。
+// 让连接保持「有数据流动」，防流静默超时掐线。下游还没收到任何数据帧时不补（见 emitted）。
 func (r *continueReader) maybeKeepalive() {
-	if keepaliveEvery > 0 && time.Since(r.lastClientAt) < keepaliveEvery {
+	if !r.emitted || (keepaliveEvery > 0 && time.Since(r.lastClientAt) < keepaliveEvery) {
 		return
 	}
 	r.out = append(r.out, ": keepalive\n\n"...)
 	r.lastClientAt = time.Now()
+}
+
+// pendingSeg 一次「换段」上游请求的在途状态。
+type pendingSeg struct {
+	ch      chan segOpenResult
+	sawDone bool // 触发换段的那一段是否以 [DONE] 收尾（失败收尾时要原样使用）
+	next    int  // 换段失败后从决策链的哪一条接着判（见 decideNext）
+	onOK    func(io.ReadCloser)
+	onFail  func(status int, err error)
+}
+
+type segOpenResult struct {
+	rc     io.ReadCloser
+	status int
+	err    error
+}
+
+// openSegmentAsync 异步发起换段请求（续写 / 救援 / 盲重试共用）。
+//
+// 为什么必须异步：ChatStreamContext 是一次完整的上游 POST（十万级 prompt 的 prefill
+// 常 3~15s，慢时 30s+）。同步调用会把 Read() 卡在这段窗口里，客户端一个字节都收不
+// 到——流式客户端有 idle 超时，静默到阈值就主动断开，用户看到的就是「说到一半突然
+// 中断」。Trae 那种单段直通没有这个窗口，同一客户端在两边表现不同，这也是原因之一。
+//
+// rule 是发起这次换段的那一条（switchStarved 等）：失败时从它的下一条接着判。
+// 返回 false 表示已有在途请求（不应发生，调用方按原路径继续）。
+func (r *continueReader) openSegmentAsync(rule int, body []byte, onOK func(io.ReadCloser), onFail func(int, error)) bool {
+	if r.pending != nil {
+		return false
+	}
+	ps := &pendingSeg{ch: make(chan segOpenResult, 1), sawDone: r.segSawDone, next: rule + 1, onOK: onOK, onFail: onFail}
+	r.pending = ps
+	go func() {
+		rc, status, _, err := r.up.ChatStreamContext(r.openCtx, r.acct, body, r.clientIP, r.meta, nil)
+		ps.ch <- segOpenResult{rc: rc, status: status, err: err}
+	}()
+	return true
+}
+
+// pollPending 轮询在途的换段请求：
+//   - 拿到且成功 → 交给 onOK 安装新段（调用方随后继续读）；
+//   - 拿到但失败 → onFail 记日志，从决策链的下一条接着判（与同步版本一致，见 decideNext）；
+//   - 还没拿到 → 按需补一条 ": keepalive" 注释帧，让客户端看到数据流动。
+func (r *continueReader) pollPending() bool {
+	ps := r.pending
+	if ps == nil {
+		return false
+	}
+	wait := keepaliveEvery
+	if wait <= 0 || wait > time.Second {
+		wait = time.Second
+	}
+	select {
+	case res := <-ps.ch:
+		r.pending = nil
+		if res.err == nil && res.status < 400 && res.rc != nil {
+			ps.onOK(res.rc)
+			return true
+		}
+		if res.rc != nil {
+			res.rc.Close()
+		}
+		ps.onFail(res.status, res.err)
+		r.decideNext(ps.sawDone, ps.next)
+		return true
+	case <-time.After(wait):
+		r.maybeKeepalive()
+		return false
+	}
 }
 
 // endSegment 一段结束（DONE 或 EOF/读错误）时的决策：
@@ -458,30 +622,52 @@ func (r *continueReader) endSegment(sawDone bool) {
 	if r.done {
 		return
 	}
+	r.segSawDone = sawDone
 	if r.cur != nil {
 		r.cur.Close()
 	}
-	// 安全续写段的裁决：拿到工具调用就采纳（继续正常收尾），否则回滚到首段终态。
-	r.settleToolOnly()
-	if r.tryStarvedRetry() {
+	// 本段 usage 计入记账合计：必须在任何换段（救援、续写、盲重试）之前。
+	r.flushSegUsage()
+	// 安全续写段的裁决：拿到完整工具调用就采纳（继续正常收尾），否则回滚到首段终态。
+	r.settleToolOnly(sawDone)
+	r.decideNext(sawDone, switchStarved)
+}
+
+// 段结束后的换段决策链，按优先级排列（decideNext 依次判）。
+const (
+	switchStarved   = iota // 空截断救援（tryStarvedRetry）
+	switchToolOnly         // 安全续写（tryToolOnlyRescue）
+	switchNarration        // 预告式收尾救援（tryNarrationRetry）
+	switchContinue         // length 截断续写 / 断流盲重试（canContinue）
+)
+
+// decideNext 从第 from 条开始依次判换段，命中就异步发起；都不命中就收尾。
+//
+// 换段请求失败时从失败那一条的下一条接着判（pollPending）：与同步发起时「这条返回 false
+// 就落到下一条」一致——例如无限额请求的空截断救援失败后，仍可走一次续写。已经发起过的
+// 规则各自记了用过（starvedTried 等），不会重复发起。
+func (r *continueReader) decideNext(sawDone bool, from int) {
+	if from <= switchStarved && r.tryStarvedRetry() {
 		return
 	}
 	// 安全续写（只采纳工具调用）：模型刚看完工具结果却只写一句就收尾。
-	if r.tryToolOnlyRescue() {
+	if from <= switchToolOnly && r.tryToolOnlyRescue() {
 		return
 	}
 	// 预告式收尾（finish=stop + 正文停在「……：」上 + 工具类请求）：续写剩余内容。
 	// 这条必须排在 canContinue 之前判断，但两者互斥（后者要求 finish=length 或断流）。
-	if r.tryNarrationRetry() {
+	if from <= switchNarration && r.tryNarrationRetry() {
 		return
 	}
-	if r.canContinue(sawDone) {
+	if from > switchContinue {
+		// 续写请求本身失败：降级为截断终态（日志已在失败回调里记过）。
+	} else if r.canContinue(sawDone) {
 		// 必须是「断流盲重试」还是「length 截断续写」（r.finish 在续写成功后被重置）。
 		blind := !sawDone && r.finish == ""
 		body, err := r.continuationBody()
 		if err == nil {
-			rc, status, _, terr := r.up.ChatStreamContext(r.ctx, r.acct, body, r.clientIP, r.meta, nil)
-			if terr == nil && status < 400 && rc != nil {
+			// 异步换段：等待期内客户端只会收到 keepalive，不会出现整段静默。
+			if r.openSegmentAsync(switchContinue, body, func(rc io.ReadCloser) {
 				r.seg++
 				if blind {
 					r.blindRetried = true
@@ -502,13 +688,12 @@ func (r *continueReader) endSegment(sawDone bool) {
 				r.finish, r.tail = "", nil
 				// 本段 usage 快照归零：下一段的思考/正文构成要重新测（见 segCompletion）。
 				r.segCompletion, r.segThink = 0, 0
+			}, func(status int, terr error) {
+				log.Printf("WARN: [continue] acct=%s seg=%d 续写失败（status=%d err=%v）→ 降级为截断终态",
+					logfmt.Label(r.acct.UID, r.acct.Nickname), r.seg+1, status, terr)
+			}) {
 				return
 			}
-			if rc != nil {
-				rc.Close()
-			}
-			log.Printf("WARN: [continue] acct=%s seg=%d 续写失败（status=%d err=%v）→ 降级为截断终态",
-				logfmt.Label(r.acct.UID, r.acct.Nickname), r.seg+1, status, terr)
 		} else {
 			log.Printf("WARN: [continue] acct=%s 续写请求体构造失败: %v",
 				logfmt.Label(r.acct.UID, r.acct.Nickname), err)
@@ -516,9 +701,18 @@ func (r *continueReader) endSegment(sawDone bool) {
 	} else if r.continueCapped {
 		// 撞的是网关自己的累计输出上限，不是上游故障——写清楚，免得排障时
 		// 把它当成「又在半句处断了」。
-		log.Printf("INFO: [continue] acct=%s 累计输出 %d token 已达上限（下限 %d × %d）→ 停止续写，按截断收尾",
-			logfmt.Label(r.acct.UID, r.acct.Nickname), int(r.totalOutput()),
-			r.budgetFloor, continueTotalCapRatio)
+		log.Printf("INFO: [continue] acct=%s 累计输出 %d token 已达上限 %d → 停止续写，按截断收尾",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), int(r.totalOutput()), int(r.outputCap()))
+	}
+	r.finishStream(sawDone)
+}
+
+// finishStream 收尾：断流降级 → 回放 tail → 合成跨段合计 usage → [DONE] → 标记完成。
+// 从 endSegment 拆出来的原因：换段请求改成异步之后，失败路径（pollPending 里）也要走
+// 同一段收尾，两份实现迟早漂移。
+func (r *continueReader) finishStream(sawDone bool) {
+	if r.done {
+		return
 	}
 	// 段在没有任何 finish 的情况下以 EOF/读错误结束：疑似上游断流（正常收尾都带
 	// finish_reason）。客户端此前会看到「被标 completed 的中途截断」——这里把
@@ -543,7 +737,7 @@ func (r *continueReader) endSegment(sawDone bool) {
 		}
 	}
 	// 不续/续写失败：回放 tail（含 finish/末端帧，客户端行为与未接线时一致），
-	// 再补一条跨段合计 usage，最后 EOF（[DONE] 由 StreamHint 统一补）。
+	// 再补一条跨段合计 usage，最后 EOF（[DONE] 由 StreamHint 统一写出，恰好一条）。
 	for _, f := range r.tail {
 		r.emit(f)
 	}
@@ -552,10 +746,16 @@ func (r *continueReader) endSegment(sawDone bool) {
 		raw, _ := json.Marshal(map[string]any{"id": r.id, "object": "chat.completion.chunk", "choices": []any{}, "usage": r.usage})
 		r.emit(string(raw))
 	}
+	// 末段上游显式发了 [DONE]（正常收尾）就把它交给下游：StreamHint 只在「没见到 [DONE] 也
+	// 没见到终态」时补截断终态。中间各段的 [DONE] 照旧吞掉（续写接缝），唯独末段这一条是
+	// 「上游说完了」的事实——吞掉它，下游会把每条「没带 finish_reason 的正常流」都当成断流。
+	if sawDone {
+		r.out = append(r.out, "data: [DONE]\n\n"...)
+	}
 	// 救援效果的可观测性：本次命中的是「预告句收尾」时，记录续写后到底拿到了什么。
 	// 没有这行就分不清「救回来是工具调用（回合继续）」和「只是多打了一段正文」——
 	// 线上实测命中率能到请求量的三成，必须能算清楚收益再决定判据要不要收。
-	if r.narrationTried {
+	if r.narrationTries > 0 {
 		log.Printf("[narration] acct=%s model=%s 结果：共 %d 段，工具调用=%v，正文合计=%dB",
 			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg+1, r.toolSeen, r.text.Len())
 	}
@@ -613,21 +813,60 @@ func (r *continueReader) totalOutput() float64 {
 	return 0
 }
 
-// outputCapped 累计输出是否已达本请求上限（下限 × continueTotalCapRatio，兜底
-// defaultContinueTotalCap）。没算下限时（客户端没指定档位）用兜底值。
-func (r *continueReader) outputCapped() bool {
-	capTokens := float64(defaultContinueTotalCap)
-	if r.budgetFloor > 0 {
-		capTokens = float64(r.budgetFloor * continueTotalCapRatio)
+// atSegmentCap 本请求的上游段数是否已用完（无限额请求 noLimitContinueSegments，带限额的
+// 续写例外 maxContinueSegments）。续写、盲重试与各类救援共用这一个判据。
+func (r *continueReader) atSegmentCap() bool {
+	if !r.limitSet {
+		return r.seg >= noLimitContinueSegments-1
 	}
-	return r.totalOutput() >= capTokens
+	return r.seg >= maxContinueSegments-1
+}
+
+// outputCap 带限额请求的累计输出上限（token）= max(客户端限额, 档位下限) × continueTotalCapRatio，
+// 两者都没有时兜底 defaultContinueTotalCap；无限额请求返回 0 = 不按 token 封顶（只看段数，
+// 见 noLimitContinueSegments）。
+func (r *continueReader) outputCap() float64 {
+	if !r.limitSet {
+		return 0
+	}
+	per := max(r.limit, r.budgetFloor)
+	if per <= 0 {
+		return defaultContinueTotalCap
+	}
+	return float64(per * continueTotalCapRatio)
+}
+
+// outputCapped 累计输出是否已达本请求上限（见 outputCap）。
+func (r *continueReader) outputCapped() bool {
+	c := r.outputCap()
+	return c > 0 && r.totalOutput() >= c
+}
+
+// limitedButContinuable 客户端带了限额，但这次截断不代表它「只要这么多」，三种例外：
+//  1. 额度 ≥ clientLimitLongAnswer：这一档额度只是随手给的上限（见该常量）；
+//  2. 本段思考占了大头（starvedByThinking）：客户端要的那份回答没写出来；
+//  3. 网关把额度抬到过下限（budgetWasRaised）：生效的上限是网关选的数，不是客户端意图。
+//
+// 2、3 的续写段要关掉思考才有意义；关不掉思考的模型（glm、hy3 等）续写段会拿同一份额度
+// 把思考再烧一遍，几段合计还是半句，所以不续——零正文的形态交给 starved.go 的救援。
+//
+// 探活级额度（< minStarvedBudget，如官方客户端 max_tokens=1 的 key 探活）一律不续：出站时
+// 它不会被抬，思考占比再高也只是一句探活，续写只会白付最多 7 次上游调用。
+func (r *continueReader) limitedButContinuable() bool {
+	if r.limit > 0 && r.limit < minStarvedBudget {
+		return false
+	}
+	if r.limit >= clientLimitLongAnswer {
+		return true
+	}
+	return (r.starvedByThinking() || r.budgetWasRaised()) && r.thinkingSwitchable()
 }
 
 // canContinue 续写资格判定（sawDone=false 表示 EOF/读错误收尾——只有显式
 // finish_reason=length 才续，读错误不续，避免把故障流当截断流续错）。
 func (r *continueReader) canContinue(sawDone bool) bool {
 	switch {
-	case r.seg >= maxContinueSegments-1:
+	case r.atSegmentCap():
 		return false
 	case r.outputCapped():
 		// 累计输出到顶：再续就是无节制地烧配额了。标出来，让终态归因能区分
@@ -641,14 +880,9 @@ func (r *continueReader) canContinue(sawDone bool) bool {
 		return false
 	case r.errSeen:
 		return false
-	case r.limitSet && r.limit < clientLimitLongAnswer && !r.starvedByThinking() && !r.budgetWasRaised():
+	case r.limitSet && !r.limitedButContinuable():
 		// 客户端显式带限额 = 它只要这么多，截断是预期语义（Claude 客户端必带
-		// max_tokens，每回合 8192）。三种例外都续写：
-		//   1) 额度被思考吃光（见 continueThinkingShare）——客户端要的那份回答没写出来；
-		//   2) 网关把这个额度抬到过下限（budgetWasRaised）——此时生效的上限是**网关**
-		//      选的数，不是客户端的意图，被它切断就该接着写（否则「抬了额度还是断」
-		//      只是把断点从 1024 挪到 8192，问题没真正解决）；
-		//   3) 额度 ≥ clientLimitLongAnswer——这一档额度不代表「只要这么短」（见该常量）。
+		// max_tokens，每回合 8192）。例外见 limitedButContinuable。
 		return false
 	case r.cutNoFinish(sawDone):
 		// 段无 finish 结束 = 上游偶发断流（线上实测：15 次续写里 1 次）。已产出内容时
@@ -725,42 +959,60 @@ func (r *continueReader) continuationBodyWithNudge(nudge string) ([]byte, error)
 // 值误触发压缩（与真实上下文长度无关地提前全量压缩）。total_tokens 按
 // 「末段 prompt + 累计 completion」重算，保持口径自洽。
 func (r *continueReader) mergeUsage(u map[string]any) {
-	if r.usage == nil {
-		r.usage = map[string]any{}
+	r.usage = mergeUsageInto(r.usage, u)
+	// 记账口径的段内合并与客户端可见的合计同一规则（段内多帧 usage 时与改动前记的一样），
+	// 段结束时再按段求和进 billed（见 flushSegUsage）。
+	r.segUsage = mergeUsageInto(r.segUsage, u)
+}
+
+// mergeUsageInto 把一个 usage 帧并入 dst 并返回（dst 为 nil 时新建）：prompt 侧取最新值，
+// 其余数字叶子求和，total_tokens 按 prompt+completion 重算（口径见 mergeUsage）。
+func mergeUsageInto(dst, u map[string]any) map[string]any {
+	if dst == nil {
+		dst = map[string]any{}
 	}
 	for k, v := range u {
 		switch k {
 		case "prompt_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "prompt_tokens_details":
-			r.usage[k] = v // 末段值
+			dst[k] = v // 末段值
 		case "total_tokens":
 			// 先按末段留作兜底（段里没有 prompt_tokens 时不会重算），末尾统一
 			// 按 prompt(末段)+completion(累计) 覆盖。
-			r.usage[k] = v
+			dst[k] = v
 		default:
 			if f, ok := v.(float64); ok {
-				if d, ok2 := r.usage[k].(float64); ok2 {
-					r.usage[k] = d + f
+				if d, ok2 := dst[k].(float64); ok2 {
+					dst[k] = d + f
 					continue
 				}
-				r.usage[k] = f
+				dst[k] = f
 				continue
 			}
 			if m, ok := v.(map[string]any); ok {
-				if dm, ok2 := r.usage[k].(map[string]any); ok2 {
+				if dm, ok2 := dst[k].(map[string]any); ok2 {
 					sumInto(dm, m)
 				} else {
 					nm := map[string]any{}
 					sumInto(nm, m)
-					r.usage[k] = nm
+					dst[k] = nm
 				}
 				continue
 			}
-			r.usage[k] = v
+			dst[k] = v
 		}
 	}
-	if p, ok := r.usage["prompt_tokens"].(float64); ok {
-		c, _ := r.usage["completion_tokens"].(float64)
-		r.usage["total_tokens"] = p + c
+	if p, ok := dst["prompt_tokens"].(float64); ok {
+		c, _ := dst["completion_tokens"].(float64)
+		dst["total_tokens"] = p + c
+	}
+	return dst
+}
+
+// flushSegUsage 段结束：把本段 usage 计入记账合计 billed 并清空。必须在任何换段之前调用。
+func (r *continueReader) flushSegUsage() {
+	if r.segUsage != nil {
+		r.billed = sumUsage(r.billed, r.segUsage)
+		r.segUsage = nil
 	}
 }
 
