@@ -16,6 +16,7 @@ import (
 // 在 scheduleDue 里就置位了，Check 失败也算跑过。改成失败排一次 30 分钟后的重试。
 func TestAutoRetryAfterCheckFailure(t *testing.T) {
 	m := New("dev", "", "", Settings{AutoEnabled: true, AutoTime: "04:00"})
+	m.status.CanInstall = true // Exercise scheduling independently of the host deployment.
 	due := time.Date(2026, 10, 23, 20, 7, 0, 0, time.UTC) // 上海 10-24 04:07
 	if auto, _ := m.scheduleDue(due); !auto {
 		t.Fatal("前提失败：到点应触发")
