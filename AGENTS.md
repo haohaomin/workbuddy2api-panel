@@ -1,3 +1,9 @@
+# 上游同步与发布技能
+
+本仓的上游同步、同步后提交与发布任务，必须先读取并遵守 [workbuddy-sync-release](.agents/skills/workbuddy-sync-release/SKILL.md)。该技能随仓库维护；本机同名个人技能仅作为入口，以当前 checkout 内的版本为准。
+
+默认排除 AutoBot 专用改动，保留本仓桌面应用、更新器、部署配置和发布源。用户明确要求「同步并发布」时包含验证、提交、推送 `origin/main`、确认 GitHub Release 与 GHCR 工作流结果；不包含更新运行中的服务器或本机应用。仅要求本地同步时不扩大到发布。
+
 # 版本发布
 
 所有客户端更新源、Release 下载链接和部署示例均使用 `haohaomin/workbuddy2api-panel`，包括桌面端、网页更新器、GitHub API 回退及 GHCR 镜像。同步上游时必须保留此设置。Go module/import 路径和原作者版权归属不是更新源，不要批量替换。

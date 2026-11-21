@@ -1,0 +1,4 @@
+interface:
+  display_name: "WorkBuddy 上游同步与发布"
+  short_description: "同步 WorkBuddy 上游，排除 AutoBot，验证并推送云端发布"
+  default_prompt: "使用 $workbuddy-sync-release 同步上游提交，排除 AutoBot，提交并推送远程，确认 GitHub 云端构建发布。"
