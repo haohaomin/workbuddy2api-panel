@@ -269,6 +269,26 @@ curl -s http://127.0.0.1:7863/v1/images/strip-watermark   -H "Authorization: Bea
 
 边界：只裁「整条纯白留白」，不做 inpainting；`min_blank_px` 调小会切到画面内容；裁切会改画幅，介意就 `keep_blank` 少裁一点。图片地址只允许上游产物域（`.myqcloud.com`），防止被当成 SSRF 跳板。
 
+## 搜索、嵌入与语音
+
+这些接口使用与对话相同的 Bearer 鉴权。搜索、抓页、嵌入和音频请求也会进入请求台账。
+
+| 路径（POST） | 用途与边界 |
+| --- | --- |
+| `/v1/search`、`/v1/fetch` | 联网检索与网页正文抓取；检索可用 `deep:true` 请求带引用的综述。 |
+| `/v1/tools/search`、`/v1/tools/fetch` | DeepSeek 兼容别名，不依赖客户端 User-Agent。`need_content`、`ori_question`、`localization` 当前被忽略；需要检索正文时使用 `deep:true`。 |
+| `/v1/embeddings` | OpenAI 兼容嵌入，使用 `model:"bge-m3"`；此模型不在对话模型目录中。`features.embeddings_enabled` 默认关闭。 |
+| `/v1/audio/speech` | 语音合成，JSON 传入 `input`。输出支持 `wav`（默认）或 `pcm`，24kHz 单声道；省略 `voice` 使用 `f191_female_cn_tts2.5_flash`，不支持 OpenAI 的 `alloy` 等音色。`features.tts_enabled` 默认关闭。 |
+| `/v1/audio/transcriptions` | 语音识别，multipart 上传 `file` 或 `audio`，音频不超过 3MB，使用 WAV/WebM 等带容器头的格式。`response_format` 支持 `json`（默认）和 `text`。`features.asr_enabled` 默认关闭。 |
+
+嵌入和语音开关在面板配置中保存后热生效；关闭时端点返回 403。语音不在 `/v1/models` 目录中；上游已报告跑通 TTS→ASR 闭环，实际可用性仍取决于账号与服务端。
+
+## 登录代理与续写设置
+
+`features.login_bind_proxy` 默认开启：添加账号时从代理池选择一个启用节点，优先健康节点；登录请求走该出口，账号保存后固定绑定到同一节点。没有启用节点或关闭此开关时登录走直连；有启用节点但都不健康时仍尝试代理，失败会报告代理错误。此开关保存后热生效。
+
+面板概况新增「今日救援」，展示 narration / toolonly / starved 的续写救援总次数，悬停可看分类；计数保存在进程内，跨天或重启后归零。`features.narration_enabled=false` 可关闭预告式收尾救援（默认开启，热生效）。每次救援会增加一次上游调用与上下文费用；自动续写指令已标明「网关自动续写·非用户消息」。排查未触发的原因时，可设置 `WB2API_RESCUE_TRACE=1` 启用原因码日志。
+
 ## 配置与数据
 
 | 路径 | 用途 |

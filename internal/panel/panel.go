@@ -75,6 +75,10 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
+	// RescueToday 今日各类救援次数（narration/toolonly/starved）；nil 时不上报。
+	// 用来把「今天怎么突然多花了钱」变成面板上一眼能看到的数（issue #273）。
+	RescueToday func() map[string]int
+
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -227,6 +231,11 @@ type loginSession struct {
 	// 国际域 codebuddy.ai 与 workbuddy.ai 同后端不同主机，混用会把请求打到非签发域。
 	// 空 = 老会话/未指定，按 cn 处理（siteOrDefault 归一）。
 	site string
+	// proxyID 本次登录出站钉住的号池节点（空 = 直连）。登录开始时选一次、poll 的
+	// 三个端点都用它，账号落盘后再写成该号的固定绑定（见 bindLoginProxy）：加号用的
+	// 出口与之后做任务用的出口必须是同一条，否则「先在这条 IP 上注册、再换一条用」
+	// 本身就是风控眼里的强关联信号，也查不出这号是哪个出口注册的。
+	proxyID string
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。前端每 3s 轮询，而成功
 	// 分支的副作用可能耗时数秒：没有这个闸门，第二个并发 poll 会把整段流程再跑一遍。
 	processing bool
@@ -434,7 +443,17 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"balance_refreshed_at": p.balanceRefreshedAt(),
 		// 账号目录热重载（issue #199）：面板显示「上次重载时间/结果摘要」。
 		"reload": p.reloadSnapshot(),
+		// 今日救援次数（issue #273）：每条救援都要多打一次上游、重付整段 prompt。
+		"rescue_today": p.rescueToday(),
 	})
+}
+
+// rescueToday 今日各类救援次数；未接回调（或跨天归零后）为空对象。
+func (p *Panel) rescueToday() map[string]int {
+	if p.cfg.RescueToday == nil {
+		return map[string]int{}
+	}
+	return p.cfg.RescueToday()
 }
 
 // reloadSnapshot 热重载状态（面板展示用）。无轮询时 interval_sec=0，前端据此
