@@ -213,8 +213,10 @@ curl -s http://127.0.0.1:7863/mcp \
 | `list_generation_models` | 列可用的生图 / 出视频模型（读目录旁路缓存，不打上游），带计费与直链时效说明 |
 | `generate_image` | 文生图，参数 `prompt`（必填）、`model`、`size`、`quality`、`n`；同步回 URL |
 | `edit_image` | 改图，参数 `prompt`（必填）、`image`（URL 或 `data:` URL，必填）、`model` |
-| `generate_video` | 出视频，参数 `prompt`（必填）、`model`、`seconds`、`resolution`、`aspect_ratio`、`negative_prompt`、`enable_audio`、`image`、`last_image`、`wait`（缺省 `true`） |
+| `generate_video` | 出视频，参数 `prompt`（必填）、`model`、`seconds`、`resolution`、`aspect_ratio`、`negative_prompt`、`enable_audio`、`image`、`last_image`、`reference_images`、`reference_videos`、`reference_audios`（参考素材 URL 数组）、`wait`（缺省 `true`） |
 | `get_video_task` | 查任务 / 收片，参数 `task_id` |
+
+参考素材由上游服务直接下载，URL 必须能被上游访问；本机能打开并不代表上游可达。参考图、视频和音频均可通过对应的 `reference_*` 参数传入。
 
 客户端配置（Claude Code / DSH / 任何支持 HTTP MCP 的宿主）：
 
